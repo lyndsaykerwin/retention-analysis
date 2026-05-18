@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Editing artifacts
+*.bak
+*.bak.*
+
+# Excel lock files (~$ prefix when a file is open)
+~$*.xlsx
+~$*.xls
+
+# Scratch outputs — keep only the bundled sample fixture, ignore anything else
+/tmp/
+out/
+output/
+scratch/
+
+# Per-user Claude Code state if someone clones into ~/.claude/skills/
+.claude/
