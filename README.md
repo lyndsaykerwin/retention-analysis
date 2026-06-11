@@ -1,6 +1,6 @@
 # retention-analysis
 
-An agent skill that turns customer-level revenue into an **investor-grade SaaS retention analysis**. Works in any agent harness that can run a skill — it isn't tied to a specific tool.
+An agent skill that turns customer-level revenue into an **investor-grade SaaS retention analysis**. Works in any agent harness that can run a skill.
 
 Give it customer-level recurring revenue in whatever shape you have it:
 
@@ -65,7 +65,7 @@ Once the skill is installed in your agent's skills folder, point the agent at a 
 
 > "Analyze the customer retention in this workbook"
 
-The agent triggers the skill, runs the survey step, asks you ONE upfront question to confirm schema and methodology, then builds the deliverable end-to-end. The skill explicitly tells the agent not to drip-feed checkpoints — one confirmation up front, then it runs.
+The agent triggers the skill, runs the survey step, asks you one upfront question to confirm schema and methodology, then builds the deliverable end-to-end.
 
 ## What's in the repo
 
