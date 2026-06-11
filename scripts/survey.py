@@ -8,7 +8,7 @@ signal, summary/total rows, derived blocks, negative values, and overall
 sufficiency assessment.
 
 This script does NOT extract data into a working dataframe. It only produces
-hypotheses for the lead Claude agent to confirm with the user before any math
+hypotheses for the lead agent to confirm with the user before any math
 runs (compute.py, owned by another component, takes a long-format CSV instead).
 
 CLI:
@@ -968,7 +968,7 @@ def render_text(report: dict) -> str:
 # ---------------------------------------------------------------------------
 
 # Path to the bundled synthetic test fixture. Resolved relative to this file so
-# it works whether the skill is run from ~/.claude/skills/ or a fresh clone.
+# it works whether the skill runs from an agent's skills folder or a fresh clone.
 DEFAULT_FIXTURE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "fixtures",

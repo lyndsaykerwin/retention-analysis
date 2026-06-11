@@ -8,12 +8,12 @@ formula-driven Excel workbook plus a markdown summary.
 Three sheet-layout modes:
 
 * aggregating  — source has many rows per customer (one per product line / type).
-                 Helper sheet = "Customer Cube" with SUMIFS aggregating by
+                 Helper sheet = "Raw Data with Analysis" with SUMIFS aggregating by
                  customer + type filter. Includes the self-validation block at
                  the top (active counts, type-decomposed MRR totals, recon
                  against Raw Data direct sums).
 * passthrough  — source already has one row per customer. Helper sheet =
-                 "Data with Analysis" with live 1:1 refs back to Raw Data.
+                 "Raw Data with Analysis" with live 1:1 refs back to Raw Data.
 * twotab       — no source workbook; Raw Data tab is built from the CSV.
 
 Sheet 3 ("Raw Data") is ALWAYS a verbatim copy of the source workbook in
@@ -110,24 +110,24 @@ FIRST_DATA_COL = 2  # column B = first date column
 
 
 # ---------------------------------------------------------------------------
-# Layout constants (Customer Cube / helper)
+# Layout constants (Raw Data with Analysis / helper)
 # ---------------------------------------------------------------------------
 
-CUBE_ROW_HDR = 1
-CUBE_ROW_ACTIVE = 2
-CUBE_ROW_RETAINED = 3
-CUBE_ROW_CHECK_ACTIVE = 4
+ANALYSIS_ROW_HDR = 1
+ANALYSIS_ROW_ACTIVE = 2
+ANALYSIS_ROW_RETAINED = 3
+ANALYSIS_ROW_CHECK_ACTIVE = 4
 # row 5 blank divider
-CUBE_ROW_REC = 6
-CUBE_ROW_REOCC = 7
-CUBE_ROW_NONREC = 8
-CUBE_ROW_TOTAL = 9
-CUBE_ROW_CHECK_TOTAL = 10
-CUBE_ROW_CHECK_INSCOPE = 11
-CUBE_FIRST_CUST_ROW = 12
+ANALYSIS_ROW_REC = 6
+ANALYSIS_ROW_REOCC = 7
+ANALYSIS_ROW_NONREC = 8
+ANALYSIS_ROW_TOTAL = 9
+ANALYSIS_ROW_CHECK_TOTAL = 10
+ANALYSIS_ROW_CHECK_INSCOPE = 11
+ANALYSIS_FIRST_CUST_ROW = 12
 
-CUBE_LABEL_COL = 1
-CUBE_FIRST_MONTH_COL = 2  # column B
+ANALYSIS_LABEL_COL = 1
+ANALYSIS_FIRST_MONTH_COL = 2  # column B
 
 
 # ---------------------------------------------------------------------------
@@ -351,14 +351,14 @@ def write_raw_from_csv(ws, customers: List[str], months: List[str],
 
 
 # ---------------------------------------------------------------------------
-# Helper sheet — Customer Cube (aggregating mode)
+# Helper sheet — Raw Data with Analysis (aggregating mode)
 # ---------------------------------------------------------------------------
 
 
-def write_customer_cube_sheet(
+def write_analysis_sheet(
     ws,
     customers: List[str],
-    months_cube: List[str],
+    months_analysis: List[str],
     src_sheet_name: str,
     src_customer_col: str,
     src_type_col: str,
@@ -369,7 +369,7 @@ def write_customer_cube_sheet(
     all_types: List[str],
     raw_sheet_name: str = "Raw Data",
 ) -> None:
-    """Build the Customer Cube helper sheet.
+    """Build the Raw Data with Analysis helper sheet.
 
     Layout (per the new SKILL.md):
       Row 1   Month headers          col A = "Customer ID"
@@ -392,9 +392,9 @@ def write_customer_cube_sheet(
     # not the original source sheet name. The verbatim Raw Data tab keeps the
     # source's contents but is named "Raw Data" in this workbook.
     src_sheet_name = raw_sheet_name
-    n_months = len(months_cube)
+    n_months = len(months_analysis)
     n_cust = len(customers)
-    last_cust_row = CUBE_FIRST_CUST_ROW + n_cust - 1
+    last_cust_row = ANALYSIS_FIRST_CUST_ROW + n_cust - 1
 
     src_first_date_idx = column_index_from_string(src_first_date_col)
     src_last_date_idx = src_first_date_idx + n_months - 1
@@ -404,58 +404,58 @@ def write_customer_cube_sheet(
     cust_rng = f"'{src_sheet_name}'!${src_customer_col}${src_first_data_row}:${src_customer_col}${src_last_data_row}"
 
     # Header row 1
-    hdr_a = ws.cell(row=CUBE_ROW_HDR, column=CUBE_LABEL_COL, value="Customer ID")
+    hdr_a = ws.cell(row=ANALYSIS_ROW_HDR, column=ANALYSIS_LABEL_COL, value="Customer ID")
     hdr_a.font = font_subheader()
     hdr_a.fill = fill(SUBHEADER_FILL)
     hdr_a.alignment = Alignment(horizontal="left")
 
-    for j, m in enumerate(months_cube):
-        col = CUBE_FIRST_MONTH_COL + j
-        cell = ws.cell(row=CUBE_ROW_HDR, column=col, value=fmt_month_label(m))
+    for j, m in enumerate(months_analysis):
+        col = ANALYSIS_FIRST_MONTH_COL + j
+        cell = ws.cell(row=ANALYSIS_ROW_HDR, column=col, value=fmt_month_label(m))
         cell.font = font_subheader()
         cell.fill = fill(SUBHEADER_FILL)
         cell.alignment = Alignment(horizontal="center")
 
     # Row 2: # Active customers (COUNTIF on customer rows of THIS sheet)
-    ws.cell(row=CUBE_ROW_ACTIVE, column=CUBE_LABEL_COL,
+    ws.cell(row=ANALYSIS_ROW_ACTIVE, column=ANALYSIS_LABEL_COL,
             value="# Active customers").font = font_subheader()
     for j in range(n_months):
-        col = CUBE_FIRST_MONTH_COL + j
+        col = ANALYSIS_FIRST_MONTH_COL + j
         col_letter = get_column_letter(col)
-        f = f"=COUNTIF({col_letter}${CUBE_FIRST_CUST_ROW}:{col_letter}${last_cust_row},\">0\")"
-        c = ws.cell(row=CUBE_ROW_ACTIVE, column=col, value=f)
+        f = f"=COUNTIF({col_letter}${ANALYSIS_FIRST_CUST_ROW}:{col_letter}${last_cust_row},\">0\")"
+        c = ws.cell(row=ANALYSIS_ROW_ACTIVE, column=col, value=f)
         c.font = font_formula()
         c.number_format = FMT_COUNT
 
     # Row 3: # Retained vs N prior. For first <lookback> cols, value is "n/a".
     LOOKBACK = 12  # YoY; if the dataset is shorter the model is degenerate but harmless
-    ws.cell(row=CUBE_ROW_RETAINED, column=CUBE_LABEL_COL,
+    ws.cell(row=ANALYSIS_ROW_RETAINED, column=ANALYSIS_LABEL_COL,
             value=f"# Retained vs {LOOKBACK}mo prior").font = font_subheader()
     for j in range(n_months):
-        col = CUBE_FIRST_MONTH_COL + j
+        col = ANALYSIS_FIRST_MONTH_COL + j
         col_letter = get_column_letter(col)
         if j < LOOKBACK:
-            ws.cell(row=CUBE_ROW_RETAINED, column=col, value="n/a").font = font_formula()
+            ws.cell(row=ANALYSIS_ROW_RETAINED, column=col, value="n/a").font = font_formula()
         else:
             prior_letter = get_column_letter(col - LOOKBACK)
-            f = (f"=SUMPRODUCT(({col_letter}${CUBE_FIRST_CUST_ROW}:{col_letter}${last_cust_row}>0)"
-                 f"*({prior_letter}${CUBE_FIRST_CUST_ROW}:{prior_letter}${last_cust_row}>0))")
-            c = ws.cell(row=CUBE_ROW_RETAINED, column=col, value=f)
+            f = (f"=SUMPRODUCT(({col_letter}${ANALYSIS_FIRST_CUST_ROW}:{col_letter}${last_cust_row}>0)"
+                 f"*({prior_letter}${ANALYSIS_FIRST_CUST_ROW}:{prior_letter}${last_cust_row}>0))")
+            c = ws.cell(row=ANALYSIS_ROW_RETAINED, column=col, value=f)
             c.font = font_formula()
             c.number_format = FMT_COUNT
 
     # Row 4: Check # Active vs Raw Data — independent recount.
     # Uses SUMPRODUCT over the in-scope type filter against the customer list.
-    ws.cell(row=CUBE_ROW_CHECK_ACTIVE, column=CUBE_LABEL_COL,
+    ws.cell(row=ANALYSIS_ROW_CHECK_ACTIVE, column=ANALYSIS_LABEL_COL,
             value="  Check # Active vs Raw Data").font = font_formula()
     type_filter_or = ",".join(in_scope_types)
     for j in range(n_months):
-        col = CUBE_FIRST_MONTH_COL + j
+        col = ANALYSIS_FIRST_MONTH_COL + j
         col_letter = get_column_letter(col)
         src_col_letter = get_column_letter(src_first_date_idx + j)
         src_rng = f"'{src_sheet_name}'!${src_col_letter}${src_first_data_row}:${src_col_letter}${src_last_data_row}"
         # An "active" customer is one with a positive in-scope sum.
-        # The check is: COUNTIF on cube row above = count of customers with
+        # The check is: COUNTIF on analysis sheet row above = count of customers with
         # positive sum on raw direct path.
         # For multi-type filter, use SUMPRODUCT(--(SUMIFS-array > 0)).
         # Since openpyxl can't easily write CSE array formulas, we use a
@@ -470,21 +470,21 @@ def write_customer_cube_sheet(
             # SUMPRODUCT(1/COUNTIFS) — but that fails on zero rows.
             # Use the array form via SUMPRODUCT with SUMIFS, which works in
             # Excel/LibreOffice as an implicit array context.
-            f = (f"={col_letter}{CUBE_ROW_ACTIVE}"
+            f = (f"={col_letter}{ANALYSIS_ROW_ACTIVE}"
                  f" - SUMPRODUCT(--("
-                 f"SUMIFS({src_rng},{type_rng},\"{t}\",{cust_rng},$A${CUBE_FIRST_CUST_ROW}:$A${last_cust_row})>0))")
+                 f"SUMIFS({src_rng},{type_rng},\"{t}\",{cust_rng},$A${ANALYSIS_FIRST_CUST_ROW}:$A${last_cust_row})>0))")
         else:
             # Multi-type: chain SUMIFS sums per type, then OR via sum.
             # SUMPRODUCT(--((SUMIFS_type1 + SUMIFS_type2 + ...) > 0))
             sumifs_parts = []
             for t in in_scope_types:
                 sumifs_parts.append(
-                    f"SUMIFS({src_rng},{type_rng},\"{t}\",{cust_rng},$A${CUBE_FIRST_CUST_ROW}:$A${last_cust_row})"
+                    f"SUMIFS({src_rng},{type_rng},\"{t}\",{cust_rng},$A${ANALYSIS_FIRST_CUST_ROW}:$A${last_cust_row})"
                 )
             inner = " + ".join(sumifs_parts)
-            f = (f"={col_letter}{CUBE_ROW_ACTIVE}"
+            f = (f"={col_letter}{ANALYSIS_ROW_ACTIVE}"
                  f" - SUMPRODUCT(--(({inner}) > 0))")
-        c = ws.cell(row=CUBE_ROW_CHECK_ACTIVE, column=col, value=f)
+        c = ws.cell(row=ANALYSIS_ROW_CHECK_ACTIVE, column=col, value=f)
         c.font = font_xsheet()  # cross-sheet, green
         c.number_format = FMT_COUNT
 
@@ -492,9 +492,9 @@ def write_customer_cube_sheet(
 
     # Rows 6/7/8: per-type totals via INDEX/MATCH dynamic column lookup
     type_rows = [
-        (CUBE_ROW_REC, "Recurring"),
-        (CUBE_ROW_REOCC, "Re-occurring"),
-        (CUBE_ROW_NONREC, "Non-recurring"),
+        (ANALYSIS_ROW_REC, "Recurring"),
+        (ANALYSIS_ROW_REOCC, "Re-occurring"),
+        (ANALYSIS_ROW_NONREC, "Non-recurring"),
     ]
     # Build the wide date block range on the source sheet
     src_block = (
@@ -510,31 +510,31 @@ def write_customer_cube_sheet(
 
     for row, type_name in type_rows:
         # Label in column A, italic-like (just black formula font)
-        ws.cell(row=row, column=CUBE_LABEL_COL,
+        ws.cell(row=row, column=ANALYSIS_LABEL_COL,
                 value=f"  {type_name}").font = font_formula()
         # If this type isn't in the source at all, still write the row but with
         # SUMIFS that yield 0; useful for the row 10 full-type recon.
         for j in range(n_months):
-            col = CUBE_FIRST_MONTH_COL + j
+            col = ANALYSIS_FIRST_MONTH_COL + j
             col_letter = get_column_letter(col)
             # Header-cell address (used inside MATCH)
-            header_cell_addr = f"{col_letter}${CUBE_ROW_HDR}"
+            header_cell_addr = f"{col_letter}${ANALYSIS_ROW_HDR}"
             # The header on this sheet is "YYYY-M#"; the header on the source
             # is a real date or "YYYY-M#" string. To make MATCH work both ways
-            # we encode the cube's header as the SAME string the source uses.
+            # we encode the analysis sheet's header as the SAME string the source uses.
             # In the EOS source the header row contains real date values
             # (e.g. 2021-01-01) — so MATCH would need a date too. We pre-compute
             # the date and use the source's actual date for the MATCH lookup.
-            # Implementation: write the cube header as YYYY-MD style AND use
+            # Implementation: write the analysis sheet header as YYYY-MD style AND use
             # MATCH against a cell on this sheet whose value matches a date in
             # the source header row. For robustness, the MATCH operates on a
-            # 1-row range; if the source headers are dates and the cube header
+            # 1-row range; if the source headers are dates and the analysis sheet header
             # is text, the lookup will fail. To handle that, we MATCH on
             # DATEVALUE — but DATEVALUE requires text input. Cleanest path:
             # also write a row 0 hidden helper, but simpler: convert source
-            # headers to text on the cube via VALUE+TEXT — too brittle.
+            # headers to text on the analysis sheet via VALUE+TEXT — too brittle.
             #
-            # Pragmatic choice: emit the cube header AS a date (Excel-typed)
+            # Pragmatic choice: emit the analysis sheet header AS a date (Excel-typed)
             # and let MATCH find it directly. We do this in the header row
             # writer above by writing as fmt_month_label only as the visible
             # label, but we ALSO leave a parallel date inside the formula.
@@ -554,29 +554,29 @@ def write_customer_cube_sheet(
             c.number_format = FMT_NUMBER
 
     # Row 9: Total MRR (all types)
-    ws.cell(row=CUBE_ROW_TOTAL, column=CUBE_LABEL_COL,
+    ws.cell(row=ANALYSIS_ROW_TOTAL, column=ANALYSIS_LABEL_COL,
             value="Total MRR (all types)").font = font_subheader()
     for j in range(n_months):
-        col = CUBE_FIRST_MONTH_COL + j
+        col = ANALYSIS_FIRST_MONTH_COL + j
         col_letter = get_column_letter(col)
-        f = (f"={col_letter}{CUBE_ROW_REC}+{col_letter}{CUBE_ROW_REOCC}"
-             f"+{col_letter}{CUBE_ROW_NONREC}")
-        c = ws.cell(row=CUBE_ROW_TOTAL, column=col, value=f)
+        f = (f"={col_letter}{ANALYSIS_ROW_REC}+{col_letter}{ANALYSIS_ROW_REOCC}"
+             f"+{col_letter}{ANALYSIS_ROW_NONREC}")
+        c = ws.cell(row=ANALYSIS_ROW_TOTAL, column=col, value=f)
         c.font = font_formula(bold=True)
         c.number_format = FMT_NUMBER
 
     # Row 10: Check vs Raw Data direct column sum (must = 0)
-    ws.cell(row=CUBE_ROW_CHECK_TOTAL, column=CUBE_LABEL_COL,
+    ws.cell(row=ANALYSIS_ROW_CHECK_TOTAL, column=ANALYSIS_LABEL_COL,
             value="  Check vs Raw Data").font = font_formula()
     for j in range(n_months):
-        col = CUBE_FIRST_MONTH_COL + j
+        col = ANALYSIS_FIRST_MONTH_COL + j
         col_letter = get_column_letter(col)
         src_col_letter = get_column_letter(src_first_date_idx + j)
         src_rng_j = (f"'{src_sheet_name}'!"
                      f"${src_col_letter}${src_first_data_row}:"
                      f"${src_col_letter}${src_last_data_row}")
-        f = f"={col_letter}{CUBE_ROW_TOTAL} - SUM({src_rng_j})"
-        c = ws.cell(row=CUBE_ROW_CHECK_TOTAL, column=col, value=f)
+        f = f"={col_letter}{ANALYSIS_ROW_TOTAL} - SUM({src_rng_j})"
+        c = ws.cell(row=ANALYSIS_ROW_CHECK_TOTAL, column=col, value=f)
         c.font = font_xsheet()
         c.number_format = FMT_NUMBER
 
@@ -584,18 +584,18 @@ def write_customer_cube_sheet(
     # customer rows below; must = 0 if the customer-row SUMIFS uses the same
     # type filter.
     label = "  Check (" + " + ".join(in_scope_types) + ") vs customer rows"
-    ws.cell(row=CUBE_ROW_CHECK_INSCOPE, column=CUBE_LABEL_COL,
+    ws.cell(row=ANALYSIS_ROW_CHECK_INSCOPE, column=ANALYSIS_LABEL_COL,
             value=label).font = font_formula()
     for j in range(n_months):
-        col = CUBE_FIRST_MONTH_COL + j
+        col = ANALYSIS_FIRST_MONTH_COL + j
         col_letter = get_column_letter(col)
         in_scope_sum = " + ".join(
-            f"{col_letter}{CUBE_ROW_REC if t == 'Recurring' else (CUBE_ROW_REOCC if t == 'Re-occurring' else CUBE_ROW_NONREC)}"
+            f"{col_letter}{ANALYSIS_ROW_REC if t == 'Recurring' else (ANALYSIS_ROW_REOCC if t == 'Re-occurring' else ANALYSIS_ROW_NONREC)}"
             for t in in_scope_types
         )
-        f = (f"=({in_scope_sum}) - SUM({col_letter}${CUBE_FIRST_CUST_ROW}:"
+        f = (f"=({in_scope_sum}) - SUM({col_letter}${ANALYSIS_FIRST_CUST_ROW}:"
              f"{col_letter}${last_cust_row})")
-        c = ws.cell(row=CUBE_ROW_CHECK_INSCOPE, column=col, value=f)
+        c = ws.cell(row=ANALYSIS_ROW_CHECK_INSCOPE, column=col, value=f)
         c.font = font_formula()
         c.number_format = FMT_NUMBER
 
@@ -603,12 +603,12 @@ def write_customer_cube_sheet(
     # SUMIFS with two criteria: customer id + type filter (one row per in-scope
     # type, summed). When there's >1 in-scope type we add the SUMIFS terms.
     for i, cust in enumerate(customers):
-        r = CUBE_FIRST_CUST_ROW + i
+        r = ANALYSIS_FIRST_CUST_ROW + i
         # Customer ID literal (or formula to source? — leave literal since the
         # source has many rows per customer)
-        ws.cell(row=r, column=CUBE_LABEL_COL, value=cust).font = font_subheader()
+        ws.cell(row=r, column=ANALYSIS_LABEL_COL, value=cust).font = font_subheader()
         for j in range(n_months):
-            col = CUBE_FIRST_MONTH_COL + j
+            col = ANALYSIS_FIRST_MONTH_COL + j
             src_col_letter = get_column_letter(src_first_date_idx + j)
             src_rng_j = (f"'{src_sheet_name}'!"
                          f"${src_col_letter}${src_first_data_row}:"
@@ -624,42 +624,42 @@ def write_customer_cube_sheet(
             c.number_format = FMT_NUMBER
 
     # Column widths
-    ws.column_dimensions[get_column_letter(CUBE_LABEL_COL)].width = 38
+    ws.column_dimensions[get_column_letter(ANALYSIS_LABEL_COL)].width = 38
     for j in range(n_months):
-        ws.column_dimensions[get_column_letter(CUBE_FIRST_MONTH_COL + j)].width = 12
+        ws.column_dimensions[get_column_letter(ANALYSIS_FIRST_MONTH_COL + j)].width = 12
 
-    ws.freeze_panes = ws.cell(row=CUBE_FIRST_CUST_ROW, column=CUBE_FIRST_MONTH_COL)
+    ws.freeze_panes = ws.cell(row=ANALYSIS_FIRST_CUST_ROW, column=ANALYSIS_FIRST_MONTH_COL)
 
 
 # ---------------------------------------------------------------------------
-# Corkscrew sheet — aggregating mode (references Customer Cube)
+# Corkscrew sheet — aggregating mode (references Raw Data with Analysis)
 # ---------------------------------------------------------------------------
 
 
 def write_corkscrew_sheet_aggregating(
     ws,
     customers: List[str],
-    months_cube: List[str],
+    months_analysis: List[str],
     arr_factor: float,
     methodology_label: str,
     company: str,
     in_scope_types: List[str],
-    cube_sheet_name: str,
+    analysis_sheet_name: str,
     lookback: int = 12,
 ) -> None:
     """Write the Corkscrew with YoY rollforward (or N-period lookback).
-    All movement formulas reference the Customer Cube prior and current
+    All movement formulas reference the Raw Data with Analysis prior and current
     columns. Multi-type recon block written when len(in_scope_types) > 1."""
-    n_months = len(months_cube)
+    n_months = len(months_analysis)
     n_cust = len(customers)
-    last_cust_row = CUBE_FIRST_CUST_ROW + n_cust - 1
+    last_cust_row = ANALYSIS_FIRST_CUST_ROW + n_cust - 1
     n_periods = n_months - lookback  # number of comparison periods
     if n_periods <= 0:
         raise ValueError(
             f"Not enough months for {lookback}-period lookback: {n_months} months."
         )
 
-    months_periods = months_cube[lookback:]  # comparison-period labels
+    months_periods = months_analysis[lookback:]  # comparison-period labels
 
     # Title (row 1) — centerContinuous, navy fill, white bold
     title_text = (
@@ -710,7 +710,7 @@ def write_corkscrew_sheet_aggregating(
     vs_label.alignment = Alignment(horizontal="left")
     for j, m in enumerate(months_periods):
         col = FIRST_DATA_COL + j
-        prior_label = fmt_month_label(months_cube[j])  # prior = T-N
+        prior_label = fmt_month_label(months_analysis[j])  # prior = T-N
         c = ws.cell(row=ROW_VS, column=col, value=f"vs {prior_label}")
         c.font = font_subheader()
         c.fill = fill(SUBHEADER_FILL)
@@ -734,20 +734,20 @@ def write_corkscrew_sheet_aggregating(
         if r in (ROW_BEGIN, ROW_END):
             c.fill = fill(KEY_METRIC_FILL)
 
-    # Helper: cube column letter for a given source month index
-    def cube_col(month_index: int) -> str:
-        return get_column_letter(CUBE_FIRST_MONTH_COL + month_index)
+    # Helper: analysis sheet column letter for a given source month index
+    def analysis_col(month_index: int) -> str:
+        return get_column_letter(ANALYSIS_FIRST_MONTH_COL + month_index)
 
     for j in range(n_periods):
         col = FIRST_DATA_COL + j
         col_letter = get_column_letter(col)
-        curr_idx = lookback + j           # cube column for current period
-        prior_idx = j                     # cube column for prior period
-        curr = cube_col(curr_idx)
-        prior = cube_col(prior_idx)
-        # Cube data ranges
-        rc = f"'{cube_sheet_name}'!{curr}${CUBE_FIRST_CUST_ROW}:{curr}${last_cust_row}"
-        rp = f"'{cube_sheet_name}'!{prior}${CUBE_FIRST_CUST_ROW}:{prior}${last_cust_row}"
+        curr_idx = lookback + j           # analysis sheet column for current period
+        prior_idx = j                     # analysis sheet column for prior period
+        curr = analysis_col(curr_idx)
+        prior = analysis_col(prior_idx)
+        # Analysis sheet data ranges
+        rc = f"'{analysis_sheet_name}'!{curr}${ANALYSIS_FIRST_CUST_ROW}:{curr}${last_cust_row}"
+        rp = f"'{analysis_sheet_name}'!{prior}${ANALYSIS_FIRST_CUST_ROW}:{prior}${last_cust_row}"
 
         # Beginning ARR = SUMPRODUCT((prior > 0) * prior) * ARR_factor
         f_beg = f"=SUMPRODUCT(({rp}>0)*{rp})*{arr_ref}"
@@ -789,20 +789,20 @@ def write_corkscrew_sheet_aggregating(
         c.number_format = FMT_DOLLAR  # bottom of block — $
         c.fill = fill(KEY_METRIC_FILL)
 
-        # Customer counts via HLOOKUP into cube row 2
-        cube_hdr_range = (f"'{cube_sheet_name}'!"
-                          f"$B${CUBE_ROW_HDR}:${get_column_letter(CUBE_FIRST_MONTH_COL + n_months - 1)}${CUBE_ROW_ACTIVE}")
-        f_n_prior = f"=HLOOKUP(SUBSTITUTE({col_letter}${ROW_VS},\"vs \",\"\"),{cube_hdr_range},2,FALSE)"
-        f_n_curr = f"=HLOOKUP({col_letter}${ROW_DATES},{cube_hdr_range},2,FALSE)"
+        # Customer counts via HLOOKUP into analysis sheet row 2
+        analysis_hdr_range = (f"'{analysis_sheet_name}'!"
+                          f"$B${ANALYSIS_ROW_HDR}:${get_column_letter(ANALYSIS_FIRST_MONTH_COL + n_months - 1)}${ANALYSIS_ROW_ACTIVE}")
+        f_n_prior = f"=HLOOKUP(SUBSTITUTE({col_letter}${ROW_VS},\"vs \",\"\"),{analysis_hdr_range},2,FALSE)"
+        f_n_curr = f"=HLOOKUP({col_letter}${ROW_DATES},{analysis_hdr_range},2,FALSE)"
         ws.cell(row=ROW_N_ACTIVE_PRIOR, column=col, value=f_n_prior).font = font_xsheet()
         ws.cell(row=ROW_N_ACTIVE_PRIOR, column=col).number_format = FMT_COUNT
         ws.cell(row=ROW_N_ACTIVE_CURR, column=col, value=f_n_curr).font = font_xsheet()
         ws.cell(row=ROW_N_ACTIVE_CURR, column=col).number_format = FMT_COUNT
 
-        # Retained — pull from cube row 3
-        cube_ret_range = (f"'{cube_sheet_name}'!"
-                          f"$B${CUBE_ROW_HDR}:${get_column_letter(CUBE_FIRST_MONTH_COL + n_months - 1)}${CUBE_ROW_RETAINED}")
-        f_retained = f"=HLOOKUP({col_letter}${ROW_DATES},{cube_ret_range},3,FALSE)"
+        # Retained — pull from analysis sheet row 3
+        analysis_ret_range = (f"'{analysis_sheet_name}'!"
+                          f"$B${ANALYSIS_ROW_HDR}:${get_column_letter(ANALYSIS_FIRST_MONTH_COL + n_months - 1)}${ANALYSIS_ROW_RETAINED}")
+        f_retained = f"=HLOOKUP({col_letter}${ROW_DATES},{analysis_ret_range},3,FALSE)"
         f_n_ch = f"={col_letter}{ROW_N_ACTIVE_PRIOR} - {f_retained[1:]}"  # = prior − retained
         ws.cell(row=ROW_N_CHURNED, column=col, value=f_n_ch).font = font_formula()
         ws.cell(row=ROW_N_CHURNED, column=col).number_format = FMT_COUNT
@@ -834,12 +834,12 @@ def write_corkscrew_sheet_aggregating(
         if len(in_scope_types) > 1:
             for t in in_scope_types:
                 if t == "Recurring":
-                    f_rec = f"='{cube_sheet_name}'!{curr}{CUBE_ROW_REC}*{arr_ref}"
+                    f_rec = f"='{analysis_sheet_name}'!{curr}{ANALYSIS_ROW_REC}*{arr_ref}"
                     c = ws.cell(row=ROW_REC_RECURRING, column=col, value=f_rec)
                     c.font = font_xsheet()
                     c.number_format = FMT_DOLLAR
                 elif t == "Re-occurring":
-                    f_reocc = f"='{cube_sheet_name}'!{curr}{CUBE_ROW_REOCC}*{arr_ref}"
+                    f_reocc = f"='{analysis_sheet_name}'!{curr}{ANALYSIS_ROW_REOCC}*{arr_ref}"
                     c = ws.cell(row=ROW_REC_REOCCURRING, column=col, value=f_reocc)
                     c.font = font_xsheet()
                     c.number_format = FMT_NUMBER
@@ -899,11 +899,11 @@ def write_corkscrew_sheet_aggregating(
 
 
 # ---------------------------------------------------------------------------
-# Pass-through "Data with Analysis" sheet — legacy (one row per customer source)
+# Pass-through "Raw Data with Analysis" sheet — legacy (one row per customer source)
 # ---------------------------------------------------------------------------
 
 
-def write_data_with_analysis_sheet(
+def write_analysis_passthrough_sheet(
     ws,
     customers: List[str],
     months: List[str],
@@ -917,21 +917,21 @@ def write_data_with_analysis_sheet(
     excluded_customers = excluded_customers or []
     src_date_col_idx = column_index_from_string(src_first_date_col)
     n_months = len(months)
-    excl_col = CUBE_FIRST_MONTH_COL + n_months
+    excl_col = ANALYSIS_FIRST_MONTH_COL + n_months
 
     # Title
-    title_text = "Data with Analysis — post-exclusion view"
+    title_text = "Raw Data with Analysis — post-exclusion view"
     center_continuous_across(ws, 1, 1, excl_col,
                               title_text, font_title(), fill(TITLE_FILL))
     ws.row_dimensions[1].height = 22
 
     # Header row at row 3 (row 2 left blank for visual gap)
     hdr_row = 3
-    hdr_a = ws.cell(row=hdr_row, column=CUBE_LABEL_COL, value="Customer ID")
+    hdr_a = ws.cell(row=hdr_row, column=ANALYSIS_LABEL_COL, value="Customer ID")
     hdr_a.font = font_subheader()
     hdr_a.fill = fill(SUBHEADER_FILL)
     for j, m in enumerate(months):
-        c = ws.cell(row=hdr_row, column=CUBE_FIRST_MONTH_COL + j, value=month_to_date(m))
+        c = ws.cell(row=hdr_row, column=ANALYSIS_FIRST_MONTH_COL + j, value=month_to_date(m))
         c.number_format = FMT_DATE
         c.font = font_subheader()
         c.fill = fill(SUBHEADER_FILL)
@@ -950,7 +950,7 @@ def write_data_with_analysis_sheet(
         else:
             ws.cell(row=r, column=1, value=cust).font = font_subheader()
         for j in range(n_months):
-            col = CUBE_FIRST_MONTH_COL + j
+            col = ANALYSIS_FIRST_MONTH_COL + j
             if src_row is not None:
                 src_col_letter = get_column_letter(src_date_col_idx + j)
                 f = (f"=IF('Raw Data'!{src_col_letter}{src_row}=\"\",\"\","
@@ -973,7 +973,7 @@ def write_data_with_analysis_sheet(
         else:
             ws.cell(row=r, column=1, value=cust).font = font_subheader()
         for j in range(n_months):
-            col = CUBE_FIRST_MONTH_COL + j
+            col = ANALYSIS_FIRST_MONTH_COL + j
             c = ws.cell(row=r, column=col, value=0.0)
             c.font = font_hardcode()
             c.number_format = FMT_NUMBER
@@ -982,9 +982,9 @@ def write_data_with_analysis_sheet(
 
     ws.column_dimensions["A"].width = 18
     for j in range(n_months):
-        ws.column_dimensions[get_column_letter(CUBE_FIRST_MONTH_COL + j)].width = 12
+        ws.column_dimensions[get_column_letter(ANALYSIS_FIRST_MONTH_COL + j)].width = 12
     ws.column_dimensions[get_column_letter(excl_col)].width = 12
-    ws.freeze_panes = ws.cell(row=first_data_row, column=CUBE_FIRST_MONTH_COL)
+    ws.freeze_panes = ws.cell(row=first_data_row, column=ANALYSIS_FIRST_MONTH_COL)
 
 
 def build_customer_to_src_row_map(src_path: str, src_sheet_name: str | None,
@@ -1214,8 +1214,8 @@ def deliver(
 
     methodology = f"Strict cohort, YoY ({lookback}-month lookback)"
     if mode == "aggregating":
-        # Three sheets: Corkscrew, Customer Cube, Raw Data
-        ws_cube = wb.create_sheet("Customer Cube")
+        # Three sheets: Corkscrew, Raw Data with Analysis, Raw Data
+        ws_analysis = wb.create_sheet("Raw Data with Analysis")
         ws_raw = wb.create_sheet("Raw Data")
 
         # 1. Raw Data — verbatim
@@ -1229,20 +1229,20 @@ def deliver(
             source_path, source_sheet, source_type_col, source_first_data_row
         )
         in_scope = type_filter or ["Recurring", "Re-occurring"]
-        # Use the cube's month list = full source month range
-        months_cube = get_source_months(
+        # Use the analysis sheet's month list = full source month range
+        months_analysis = get_source_months(
             source_path, source_sheet, source_first_date_col,
             header_row=source_header_row,
         )
-        if not months_cube:
+        if not months_analysis:
             # Fallback to the long-CSV month list
-            months_cube = months
+            months_analysis = months
 
-        # 3. Customer Cube
-        write_customer_cube_sheet(
-            ws_cube,
+        # 3. Raw Data with Analysis
+        write_analysis_sheet(
+            ws_analysis,
             customers=customers,
-            months_cube=months_cube,
+            months_analysis=months_analysis,
             src_sheet_name=source_sheet,
             src_customer_col=source_customer_col,
             src_type_col=source_type_col,
@@ -1257,17 +1257,17 @@ def deliver(
         write_corkscrew_sheet_aggregating(
             ws_cork,
             customers=customers,
-            months_cube=months_cube,
+            months_analysis=months_analysis,
             arr_factor=arr_factor,
             methodology_label=methodology,
             company=company,
             in_scope_types=in_scope,
-            cube_sheet_name="Customer Cube",
+            analysis_sheet_name="Raw Data with Analysis",
             lookback=lookback,
         )
 
     elif mode == "passthrough":
-        ws_helper = wb.create_sheet("Data with Analysis")
+        ws_helper = wb.create_sheet("Raw Data with Analysis")
         ws_raw = wb.create_sheet("Raw Data")
         copy_source_sheet_verbatim(source_path, source_sheet, ws_raw)
 
@@ -1278,7 +1278,7 @@ def deliver(
         post_excl = set(map(str, customers))
         excluded = [c for c in src_customers_in_order if c not in post_excl]
 
-        write_data_with_analysis_sheet(
+        write_analysis_passthrough_sheet(
             ws_helper, customers, months,
             customer_to_src_row=customer_to_src_row,
             src_customer_col=source_customer_col,
@@ -1291,12 +1291,12 @@ def deliver(
         write_corkscrew_sheet_aggregating(
             ws_cork,
             customers=customers,
-            months_cube=months,
+            months_analysis=months,
             arr_factor=arr_factor,
             methodology_label=methodology,
             company=company,
             in_scope_types=["Recurring"],  # treated as a single-type bucket
-            cube_sheet_name="Data with Analysis",
+            analysis_sheet_name="Raw Data with Analysis",
             lookback=lookback,
         )
 
@@ -1307,12 +1307,12 @@ def deliver(
         write_corkscrew_sheet_aggregating(
             ws_cork,
             customers=customers,
-            months_cube=months,
+            months_analysis=months,
             arr_factor=arr_factor,
             methodology_label=methodology,
             company=company,
             in_scope_types=["Recurring"],
-            cube_sheet_name="Raw Data",
+            analysis_sheet_name="Raw Data",
             lookback=lookback,
         )
 

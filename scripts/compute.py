@@ -54,7 +54,7 @@ from typing import Any
 
 
 # Path to the bundled synthetic test fixture. Resolved relative to this file so
-# it works whether the skill is run from ~/.claude/skills/ or a fresh clone.
+# it works whether the skill runs from an agent's skills folder or a fresh clone.
 DEFAULT_FIXTURE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "fixtures",

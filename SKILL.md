@@ -1,15 +1,21 @@
 ---
 name: retention-analysis
-description: Use when the user wants to analyze SaaS subscription retention from customer-level revenue data — building Gross / Net / Logo retention metrics, an MRR-or-ARR corkscrew rollforward, and a formula-driven Excel deliverable. Triggers on "retention", "churn", "NRR", "GRR", "logo retention", "ARR corkscrew", "customer retention", or when a user uploads a workbook of customer × month revenue. Not for forecasting, LTV/CAC, cohort-by-acquisition-month curves, or consumer/transactional churn.
+description: Use when the user wants an investor-grade retention analysis of SaaS subscription revenue from customer-level data — building Gross / Net / Logo retention metrics, an MRR-or-ARR corkscrew rollforward, and a formula-driven Excel deliverable where every number traces back to the source. Triggers on "retention", "churn", "NRR", "GRR", "logo retention", "ARR corkscrew", "customer retention", or when a user uploads customer-level revenue (wide customer × month or long/tidy form). Not for forecasting, LTV/CAC, cohort-by-acquisition-month curves, or consumer/transactional churn.
 ---
 
 # retention-analysis
 
 ## Overview
 
-Turn a workbook of customer-level revenue into a three-sheet deliverable: **Corkscrew** (rollforward + retention metrics), **Helper** (Customer Cube or Data with Analysis), and **Raw Data** (verbatim copy). Every metric is a live formula referencing the helper, which references the raw data. Change one customer's revenue in Raw Data and the entire model flexes.
+Turn customer-level revenue into an investor-grade Excel deliverable. The output is two or three sheets:
 
-Deterministic math runs in Python (the bundled scripts in `scripts/`). Workbook interpretation is done by reading sheet names, the title block, and a few sample rows — not by brittle heuristics. Python supports interpretation, not the other way around.
+- **Corkscrew** — the rollforward (a period-by-period walk from beginning to ending revenue: new, expansion, contraction, churn) plus the derived retention metrics.
+- **Raw Data with Analysis** *(optional helper)* — an intermediate sheet that filters and/or aggregates the raw data into one clean row per customer per period. **Only built when the raw data needs transformation.** When the raw data sums directly into the Corkscrew, this sheet is skipped and the deliverable is just two sheets.
+- **Raw Data** — a verbatim copy of the source.
+
+Every metric is a live formula referencing the helper (or, in the two-sheet case, Raw Data directly), which traces back to the raw data. Change one customer's revenue in Raw Data and the entire model flexes.
+
+Deterministic math runs in Python (the bundled scripts in `scripts/`). The data can arrive in either wide form (customers as rows, periods as columns) or long/tidy form (one row per customer per period); it can be an Excel workbook or a CSV. Interpretation is done by reading sheet/column structure and a few sample rows — not by brittle heuristics. Python supports interpretation, not the other way around.
 
 ## Engineering principles
 
@@ -21,20 +27,26 @@ Apply DRY, YAGNI, and check-driven thinking to every cell: name the bug each non
 
 Retention fails silently when an early interpretive choice is wrong (misidentified customer column, ARR treated as MRR, "Total" rows counted as customers). Catch it once at the top, then build.
 
-Use a single `AskUserQuestion` call after reading the file. Confirm:
+Ask the user **one consolidated question** after reading the file — use whatever structured-input mechanism your agent harness provides (a single multi-part prompt). Confirm:
 
 - **Which sheet** holds the raw data (and which to ignore)
 - **Customer column, date columns, MRR vs ARR** — state your interpretation with 2-3 sample data points so the user can verify without opening the file
 - **Revenue-type filter** (Recurring only / Recurring + Re-occurring / all)
-- **Customer-unit definition** (aggregate to Customer ID, or keep product-level)
-- **Comparison period** (MoM / QoQ / YoY / LTM — or combinations)
+- **Customer-unit definition** — aggregate to the customer level (one row per customer), or keep product-/line-level detail. Use whatever the source's customer identifier is (a name, an account number, an ID column); don't assume a specific column name.
+- **Comparison period** — see Rule 1a below for the default
 - **Negative values found** (list each one and ask: zero / treat as churn / leave)
 
 One question, all sub-parts. Wait for confirmation, then proceed end-to-end. Do not re-confirm in the middle — the reconciliation checks at the end are the next user-facing checkpoint.
 
+### 1a. Comparison period — default is year-over-year
+
+**Default to comparing equivalent periods one year apart (year-over-year, "YoY")** — e.g. this March vs last March. This is the right comparison for businesses on **annual contracts**, where a customer's renewal decision happens once a year, so a 12-month-apart comparison isolates true retention from seasonal noise.
+
+If the user asks for it — or the business runs on **monthly contracts** — offer **month-over-month ("MoM")** comparisons instead (this period vs the immediately prior period). Surface the default in the upfront question and let the user override (MoM / QoQ / YoY / LTM, or combinations).
+
 ### 2. Don't read every sheet exhaustively
 
-Sheet names are usually strong signals (`Raw Data`, `EOS - Revenue Data`, `Customer Cube`, `Cover`, `Notes`). Open the file, read every sheet's **name**, pick the obvious raw-data candidate, and read the title block + first ~10 rows of *that one sheet* to confirm. Stop searching when the right sheet is found — do not recite the structure of every sheet just because it's there.
+When the workbook has multiple sheets, a descriptive sheet name *can* point you at the raw data — but don't rely on it. Some files have unhelpful, generic, or no meaningful sheet names. Read every sheet's **name** first; if a name clearly flags the raw data, open the title block + first ~10 rows of *that one sheet* to confirm. If the names give you nothing, fall back to a quick structural peek at each sheet (row counts, whether it has a customer column and date headers) and pick the candidate that looks like raw customer-level revenue. Either way, stop searching once the right sheet is found — do not recite the structure of every sheet just because it's there.
 
 If two sheets are plausibly the source, briefly check both and surface the choice to the user. Don't deep-profile every sheet "to be safe."
 
@@ -100,23 +112,25 @@ Add comments as cells are populated, not at the end.
 2. Pick the obvious raw-data candidate by name. Read its title block (rows above the data) + first ~10 rows of the data itself.
 3. Identify: customer column, date columns, MRR vs ARR (use the numerical scale — $2,500 cells are MRR; $30,000 for the same customer is ARR), any revenue-type column, any obvious total/summary rows to exclude.
 4. Scan for negatives.
-5. Present to the user — single `AskUserQuestion` with all sub-parts (per Critical Rule 1). Include 2-3 sample data points: one customer's full row, the date range, and a small slice of the values, so the user can confirm without opening the workbook.
+5. Present to the user — one consolidated question with all sub-parts (per Critical Rule 1), using whatever structured-input mechanism your harness provides. Include 2-3 sample data points: one customer's full row, the date range, and a small slice of the values, so the user can confirm without opening the workbook.
 
 Wait for confirmation.
 
-### Phase 2 — Build the helper sheet
+### Phase 2 — Build the helper sheet (only if the raw data needs transformation)
 
-For each customer × month cell:
+**The helper sheet ("Raw Data with Analysis") is optional.** Build it only when the raw data isn't already in a clean one-row-per-customer-per-period shape — i.e. when you need to **filter** out-of-scope revenue types and/or **aggregate** multiple source rows into a single per-customer figure. If the raw data sums directly into the Corkscrew with no transformation, skip this phase entirely; the deliverable is just Corkscrew + Raw Data, and the Corkscrew references Raw Data directly.
 
-- **Pass-through (`Data with Analysis`)** — source already has one row per customer. Each helper cell is a live reference back to Raw Data: `=IF('Raw Data'!C8="","",'Raw Data'!C8)`. Includes an "Excluded?" column flagging summary/test rows; flagged rows are forced to 0 but kept for lineage.
+When a helper *is* needed, it normalizes the source into one row per customer per period. Two common cases:
 
-- **Aggregating (`Customer Cube`)** — source has multiple rows per customer (one per product line). Each helper cell aggregates with `SUMIFS`. For wide-block source data, the customer-row formula uses **direct column reference** for speed (thousands of customer rows × dozens of columns); the summary-block formulas at the top of the helper use `SUMIFS(INDEX(...), MATCH(...))` so they copy horizontally without hand-editing.
+- **Pass-through** — the source already has one row per customer. Each helper cell is a live reference back to Raw Data (e.g. `=IF('Raw Data'!C8="","",'Raw Data'!C8)`), with an "Excluded?" column flagging summary/test rows; flagged rows are forced to 0 but kept for lineage.
 
-**Helper-sheet customer rows include only customers with at least one non-zero in-scope revenue cell.** Customers that exist in Raw Data but have ONLY excluded revenue types are filtered out (they'd just be thousands of zero rows). Report the dropped count to the user in the final summary.
+- **Aggregating** — the source has multiple rows per customer (for example one row per product, plan, or line item). Each helper cell aggregates with `SUMIFS`. For wide source blocks, the customer-row formula uses a **direct column reference** for recalc speed (many customer rows × many period columns); the summary-block formulas at the top of the helper use `SUMIFS(INDEX(...), MATCH(...))` so they copy horizontally without hand-editing.
 
-**Sort order:** Customer ID ascending. For IDs like "Customer 17", "Customer 4443", parse the number and sort numerically. Deterministic order — never source-row order.
+**Helper-sheet customer rows include only customers with at least one non-zero in-scope revenue cell.** Customers that exist in Raw Data but have ONLY excluded revenue types are filtered out (they'd just be rows of zeros). Report the dropped count to the user in the final summary.
 
-**Self-validation block (only when raw needs transformation):** if you're filtering by type and aggregating per customer, the helper sheet validates itself before the Corkscrew references it. Stack a few rows at the top — see "Helper Sheet Layout" below. Skip this block when the raw data sums directly into the Corkscrew check without transformation.
+**Sort order:** by the customer identifier, in a deterministic order — never source-row order. If the identifiers embed a number (e.g. "Account 17", "Account 4443"), parse the number and sort numerically rather than as text.
+
+**Self-validation block (only when raw needs transformation):** when you filter by type and aggregate per customer, the helper validates itself before the Corkscrew references it. Stack a few check rows at the top — see "Helper Sheet Layout" below. Skip this block when the raw data sums directly into the Corkscrew check without transformation.
 
 ### Phase 3 — Build the Corkscrew
 
@@ -151,7 +165,7 @@ Example: Jan-21 to Mar-24 (M=39 months), YoY (N=12) → **27 comparison periods*
 4. **Spot-check 2-3 real customers from this dataset** (one stable, one churned, one expanded). Read the values from the deliverable (`data_only=True`), not from Python — the user's question is "does the deliverable say what you think it says." Trace each customer's MRR figure back to specific cells in both the helper and Raw Data. See "Customer Spot-Check Trace" below.
 
 5. **Show the user a one-screen reconciliation summary:**
-   - Customer Cube self-checks (if present): all = 0 ✓
+   - Raw Data with Analysis self-checks (if present): all = 0 ✓
    - Corkscrew external check: ties in every period ✓
    - Decomposed reconciliation (if present): variance = 0 ✓
    - Spot-checked customers: list with cell references
@@ -166,7 +180,7 @@ Then deliver.
 
 ### Corkscrew Sheet
 
-Three sheets total, in this order from leftmost: **Corkscrew**, **Customer Cube** (or `Data with Analysis`), **Raw Data**.
+Sheets in this order from leftmost: **Corkscrew**, **Raw Data with Analysis** *(present only when a helper is built — see Phase 2)*, **Raw Data**. When no helper is needed, it's just Corkscrew and Raw Data.
 
 Define all row positions before writing any formula — a formula written before the layout is locked points to the wrong row when a later header insertion shifts everything down.
 
@@ -217,7 +231,7 @@ Row 36    Variance vs Ending ARR     [= row 35 − row 13]   must = 0
 
 Optional LTM corkscrew block (rows 38–48) with the same shape, comparison T-12, when LTM is part of the methodology.
 
-### Helper Sheet (Customer Cube)
+### Helper Sheet (Raw Data with Analysis)
 
 Summary block on top (only when self-validation is needed per Critical Rule 4), customer data below.
 
@@ -235,7 +249,7 @@ Row 6   Recurring MRR total     SUMIFS(INDEX(Raw Data block, 0, MATCH(col$1, hea
                                        type_col, "Recurring")
 Row 7   Re-occurring MRR total  Same pattern, "Re-occurring"
 Row 8   Non-recurring MRR total Same pattern, "Non-recurring"
-                                (Keep even when out of scope — needed for full-cube recon)
+                                (Keep even when out of scope — needed for full-coverage recon)
 Row 9   Total MRR (all types)   = <col>6 + <col>7 + <col>8
 Row 10  Check vs Raw Data       = <col>9 − SUM('Raw Data'!<month_col>)   must = 0
 Row 11  Check (Rec + Re-occ)    = (<col>6 + <col>7) − SUM(customer rows)  must = 0
@@ -264,40 +278,40 @@ This tab is for user trust. The Corkscrew references the helper, not this sheet 
 
 ## Formula patterns
 
-All Corkscrew formulas reference the helper sheet (Customer Cube). The cube has month headers in row 1, customer data starting at row 12. For each Corkscrew comparison-period column, you need the **current period** and the **prior period** cube columns.
+All Corkscrew formulas reference the helper sheet (Raw Data with Analysis). The helper has month headers in row 1, customer data starting at row 12. For each Corkscrew comparison-period column, you need the **current period** and the **prior period** helper columns.
 
 **Column mapping — work this out before writing any formulas.** For YoY (12-month lookback) over a 39-month source dataset:
 
-| Corkscrew col | Period label | Cube current col | Cube prior col |
+| Corkscrew col | Period label | Helper current col | Helper prior col |
 |---|---|---|---|
 | C | 2022-M1 (idx 12) | N (idx 12) | B (idx 0) |
 | D | 2022-M2 (idx 13) | O (idx 13) | C (idx 1) |
 | AC | 2024-M3 (idx 38) | AN (idx 38) | AB (idx 26) |
 
-Rule: for Corkscrew column at offset `i` from the first comparison-period column, cube current is at month-index `lookback + i`, cube prior is at month-index `i`. Cube's first month column is B; corresponding cube column letter is `get_column_letter(2 + month_index)`.
+Rule: for Corkscrew column at offset `i` from the first comparison-period column, helper current is at month-index `lookback + i`, helper prior is at month-index `i`. The helper's first month column is B; corresponding helper column letter is `get_column_letter(2 + month_index)`.
 
-**Rollforward formulas** (`<curr>` and `<prior>` are cube column letters from the mapping):
+**Rollforward formulas** (`<curr>` and `<prior>` are helper column letters from the mapping):
 
 ```
-Beginning ARR  =SUMPRODUCT(('Customer Cube'!<prior>$12:<prior>$<last>>0)*
-                          'Customer Cube'!<prior>$12:<prior>$<last>)*$C$3
+Beginning ARR  =SUMPRODUCT(('Raw Data with Analysis'!<prior>$12:<prior>$<last>>0)*
+                          'Raw Data with Analysis'!<prior>$12:<prior>$<last>)*$C$3
 
-New ARR        =SUMPRODUCT(('Customer Cube'!<prior>$12:<prior>$<last>=0)*
-                          ('Customer Cube'!<curr>$12:<curr>$<last>>0)*
-                          'Customer Cube'!<curr>$12:<curr>$<last>)*$C$3
+New ARR        =SUMPRODUCT(('Raw Data with Analysis'!<prior>$12:<prior>$<last>=0)*
+                          ('Raw Data with Analysis'!<curr>$12:<curr>$<last>>0)*
+                          'Raw Data with Analysis'!<curr>$12:<curr>$<last>)*$C$3
 
-Upsell         =SUMPRODUCT(('Customer Cube'!<prior>$12:<prior>$<last>>0)*
-                          ('Customer Cube'!<curr>$12:<curr>$<last>>'Customer Cube'!<prior>$12:<prior>$<last>)*
-                          ('Customer Cube'!<curr>$12:<curr>$<last>-'Customer Cube'!<prior>$12:<prior>$<last>))*$C$3
+Upsell         =SUMPRODUCT(('Raw Data with Analysis'!<prior>$12:<prior>$<last>>0)*
+                          ('Raw Data with Analysis'!<curr>$12:<curr>$<last>>'Raw Data with Analysis'!<prior>$12:<prior>$<last>)*
+                          ('Raw Data with Analysis'!<curr>$12:<curr>$<last>-'Raw Data with Analysis'!<prior>$12:<prior>$<last>))*$C$3
 
-Downsell       =SUMPRODUCT(('Customer Cube'!<prior>$12:<prior>$<last>>0)*
-                          ('Customer Cube'!<curr>$12:<curr>$<last>>0)*
-                          ('Customer Cube'!<curr>$12:<curr>$<last><'Customer Cube'!<prior>$12:<prior>$<last>)*
-                          ('Customer Cube'!<curr>$12:<curr>$<last>-'Customer Cube'!<prior>$12:<prior>$<last>))*$C$3
+Downsell       =SUMPRODUCT(('Raw Data with Analysis'!<prior>$12:<prior>$<last>>0)*
+                          ('Raw Data with Analysis'!<curr>$12:<curr>$<last>>0)*
+                          ('Raw Data with Analysis'!<curr>$12:<curr>$<last><'Raw Data with Analysis'!<prior>$12:<prior>$<last>)*
+                          ('Raw Data with Analysis'!<curr>$12:<curr>$<last>-'Raw Data with Analysis'!<prior>$12:<prior>$<last>))*$C$3
 
-Churn          =SUMPRODUCT(('Customer Cube'!<prior>$12:<prior>$<last>>0)*
-                          ('Customer Cube'!<curr>$12:<curr>$<last>=0)*
-                          (-'Customer Cube'!<prior>$12:<prior>$<last>))*$C$3
+Churn          =SUMPRODUCT(('Raw Data with Analysis'!<prior>$12:<prior>$<last>>0)*
+                          ('Raw Data with Analysis'!<curr>$12:<curr>$<last>=0)*
+                          (-'Raw Data with Analysis'!<prior>$12:<prior>$<last>))*$C$3
 
 Ending         =<col>8+<col>9+<col>10+<col>11+<col>12
 
@@ -309,10 +323,10 @@ External Check =<col>13 - (independent_sum_path × $C$3)
 **Customer-count formulas** (HLOOKUP — simple, deterministic, easy to audit):
 
 ```
-# Active prior    =HLOOKUP(SUBSTITUTE(<col>$6,"vs ",""),'Customer Cube'!$B$1:$<last>$2, 2, FALSE)
-# Active current  =HLOOKUP(<col>$5, 'Customer Cube'!$B$1:$<last>$2, 2, FALSE)
-# Churned         =<col>17 - HLOOKUP(<col>$5, 'Customer Cube'!$B$1:$<last>$3, 3, FALSE)
-# New             =<col>18 - HLOOKUP(<col>$5, 'Customer Cube'!$B$1:$<last>$3, 3, FALSE)
+# Active prior    =HLOOKUP(SUBSTITUTE(<col>$6,"vs ",""),'Raw Data with Analysis'!$B$1:$<last>$2, 2, FALSE)
+# Active current  =HLOOKUP(<col>$5, 'Raw Data with Analysis'!$B$1:$<last>$2, 2, FALSE)
+# Churned         =<col>17 - HLOOKUP(<col>$5, 'Raw Data with Analysis'!$B$1:$<last>$3, 3, FALSE)
+# New             =<col>18 - HLOOKUP(<col>$5, 'Raw Data with Analysis'!$B$1:$<last>$3, 3, FALSE)
 ```
 
 **Retention metrics** (all use `IFERROR` so empty-prior periods don't error):
@@ -379,7 +393,7 @@ A spot-check is the analyst's "show your work" — pick 2-3 real customers from 
 
 1. **Read values from the deliverable, not Python.** After recalc, re-open with `openpyxl.load_workbook(path, data_only=True)` and read the cached values from the helper sheet. The user's question is "does the deliverable say what you think it says" — so the trace must read the deliverable.
 
-2. **Cite specific cells in both Raw Data and the helper.** Example: `"Customer 45 lives in Customer Cube row 55. N55 (Jan-22 in-scope MRR) = 2,669; Z55 (Jan-23) = 10,659. The Recurring product driving expansion is Raw Data row 244 (InsightDash)."` The user must be able to click directly to the cell.
+2. **Cite specific cells in both Raw Data and the helper.** Illustrative example: `"This customer lives in Raw Data with Analysis row 55. N55 (Jan-22 in-scope MRR) = 2,669; Z55 (Jan-23) = 10,659. The Recurring line driving the expansion is Raw Data row 244."` The user must be able to click directly to the cell.
 
 3. **MRR and ARR are different units — show the multiplication step.** Write: `MRR change: +$7,990. ARR impact: +$7,990 × 12 = +$95,880.` Never label an MRR delta as "ARR" or skip the `× ARR_factor` step.
 
@@ -460,8 +474,8 @@ python3 scripts/deliver.py <compute-output.json> <long-format-csv> <output.xlsx>
 
 Before claiming done:
 
-- [ ] Scope confirmed via one upfront `AskUserQuestion` (Phase 1)
-- [ ] Three sheets in the deliverable: Corkscrew + Helper (Customer Cube or Data with Analysis) + Raw Data
+- [ ] Scope confirmed via one upfront consolidated question (Phase 1)
+- [ ] Sheets in the deliverable: Corkscrew + Raw Data, plus the Raw Data with Analysis helper *only if* the raw data needed transformation
 - [ ] **Raw Data sheet is a verbatim copy — no edits, no reformatting, no color changes**
 - [ ] All Corkscrew formulas live (no hardcoded sums or rates)
 - [ ] Corkscrew external check = 0 in every period (vs. Raw Data or pre-validated helper)
