@@ -1,6 +1,6 @@
 ---
 name: retention-analysis
-description: Use when the user wants an investor-grade retention analysis of SaaS subscription revenue from customer-level data — building Gross / Net / Logo retention metrics, an MRR-or-ARR corkscrew rollforward, and a formula-driven Excel deliverable where every number traces back to the source. Triggers on "retention", "churn", "NRR", "GRR", "logo retention", "ARR corkscrew", "customer retention", or when a user uploads customer-level revenue (wide customer × month or long/tidy form). Not for forecasting, LTV/CAC, cohort-by-acquisition-month curves, or consumer/transactional churn.
+description: Use when the user wants an investor-grade retention analysis of recurring or re-occurring revenue from customer-level data — building Gross / Net / Logo retention metrics, an MRR-or-ARR corkscrew rollforward, and a formula-driven Excel deliverable where every number traces back to the source. Triggers on "retention", "churn", "NRR", "GRR", "logo retention", "ARR corkscrew", "customer retention", or when a user uploads customer-level revenue (wide customer × month or long/tidy form). Not for forecasting, LTV/CAC, cohort-by-acquisition-month curves, or consumer/transactional churn.
 ---
 
 # retention-analysis
@@ -23,7 +23,7 @@ Apply DRY, YAGNI, and check-driven thinking to every cell: name the bug each non
 
 ## Critical Rules
 
-### 1. ONE upfront confirmation, then build
+### 1. Upfront confirmation, then build
 
 Retention fails silently when an early interpretive choice is wrong (misidentified customer column, ARR treated as MRR, "Total" rows counted as customers). Catch it once at the top, then build.
 
@@ -46,7 +46,7 @@ If the user asks for it — or the business runs on **monthly contracts** — of
 
 ### 2. Don't read every sheet exhaustively
 
-When the workbook has multiple sheets, a descriptive sheet name *can* point you at the raw data — but don't rely on it. Some files have unhelpful, generic, or no meaningful sheet names. Read every sheet's **name** first; if a name clearly flags the raw data, open the title block + first ~10 rows of *that one sheet* to confirm. If the names give you nothing, fall back to a quick structural peek at each sheet (row counts, whether it has a customer column and date headers) and pick the candidate that looks like raw customer-level revenue. Either way, stop searching once the right sheet is found — do not recite the structure of every sheet just because it's there.
+When the workbook has multiple sheets, a descriptive sheet name *can* point you at the raw data — but don't rely on it. Some files have unhelpful, generic, or no meaningful sheet names. Read every sheet's **name** first; if a name clearly flags the raw customer-level recurring revenue data, open the title block + first ~10 rows of *that one sheet* to confirm. If the names give you nothing, fall back to a quick structural peek at each sheet (row counts, whether it has a customer column and date headers) and pick the candidate that looks like raw customer-level revenue. Either way, stop searching once the right sheet is found — do not recite the structure of every sheet just because it's there.
 
 If two sheets are plausibly the source, briefly check both and surface the choice to the user. Don't deep-profile every sheet "to be safe."
 
@@ -84,7 +84,7 @@ This tab is for user trust ("nothing was edited") — the Corkscrew references t
 
 ### 8. Formula auditability — simple primitives over clever SUMPRODUCT
 
-The model is being read by a non-engineer auditing every cell. A formula that takes more than five seconds to parse is functionally wrong.
+Formulas need to be simple and easy to audit. A formula that takes more than five seconds to parse is functionally wrong.
 
 - **Counts:** `COUNTIF(range, ">0")`, not `SUMPRODUCT(--(range>0))`
 - **Conditional sums:** `SUMIFS(...)`, not `SUMPRODUCT((cond)*values)`
