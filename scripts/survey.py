@@ -8,7 +8,7 @@ signal, summary/total rows, derived blocks, negative values, and overall
 sufficiency assessment.
 
 This script does NOT extract data into a working dataframe. It only produces
-hypotheses for the lead Claude agent to confirm with the user before any math
+hypotheses for the lead agent to confirm with the user before any math
 runs (compute.py, owned by another component, takes a long-format CSV instead).
 
 CLI:
@@ -27,38 +27,12 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any
 
-# Defensive sys.path hygiene (kept after rename from inspect.py → survey.py).
-# Historical context: when this file was named inspect.py, it shadowed the
-# stdlib `inspect` module that openpyxl imports internally — running the script
-# as `__main__` put its directory at the front of sys.path. The rename removes
-# the collision; we keep the guard since it costs nothing and protects against
-# any future stdlib name clash.
-_HERE_REAL = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
-_HERE_LINK = os.path.dirname(os.path.abspath(__file__))
-
-
-def _is_local_path(p: str) -> bool:
-    if not p:
-        return True  # empty string == cwd, which Python adds for scripts
-    pr = os.path.realpath(p)
-    return pr == _HERE_REAL or pr == _HERE_LINK or p == _HERE_LINK or p == _HERE_REAL
-
-
-sys.path[:] = [p for p in sys.path if not _is_local_path(p)]
-
-# Drop any half-loaded stdlib `inspect` reference (this script was loaded as
-# __main__, not as `inspect`, so sys.modules shouldn't contain us under that
-# name — but be defensive in case someone imports this module).
-sys.modules.pop("inspect", None)
-
-import importlib  # noqa: E402
-
 try:
-    importlib.import_module("inspect")  # force stdlib resolution first
-    import openpyxl  # noqa: E402
-    from openpyxl.utils import get_column_letter  # noqa: E402
+    import openpyxl
+    from openpyxl.utils import get_column_letter
 except ImportError as _e:
     print(
         f"ERROR: openpyxl is required. Install with: pip install openpyxl  ({_e})",
@@ -71,31 +45,18 @@ except ImportError as _e:
 # Constants & helpers
 # ---------------------------------------------------------------------------
 
-SUMMARY_LABEL_PATTERNS = [
-    r"^\s*total\b",
-    r"^\s*subtotal\b",
-    r"^\s*sum\b",
-    r"^\s*grand\s+total\b",
-    r"^\s*acv\b",
-    r"^\s*arr\b",
-    r"^\s*mrr\b",
-    r"^\s*average\b",
-    r"^\s*avg\b",
-    r"^\s*count\b",
-]
-
-DERIVED_BLOCK_KEYWORDS = {
-    "new",
-    "upsell",
-    "expansion",
-    "downsell",
-    "contraction",
-    "churn",
-    "check",
-    "logo",
-    "movement",
-    "delta",
-}
+# Summary/total row labels. Matched against the WHOLE cell (with a small
+# whitelist of trailing unit words) so a real customer named "Total Wine & More"
+# or "Sum Ventures" is NOT mistaken for a total row — only cells that are
+# essentially just the keyword (optionally + a unit) count.
+_SUMMARY_TERMS = (
+    "grand total", "subtotal", "sub-total", "total", "sum", "summary",
+    "acv", "arr", "mrr", "average", "avg", "count",
+)
+_SUMMARY_SUFFIX = (
+    r"(?:\s+(?:mrr|arr|acv|revenue|recurring|re-occurring|reoccurring|"
+    r"customers?|accounts?|logos?|count|amount|rate|%|\$|usd))*"
+)
 
 CUSTOMER_HEADER_HINTS = [
     "customer id",
@@ -112,15 +73,212 @@ CUSTOMER_HEADER_HINTS = [
 
 
 def is_summary_label(value: Any) -> bool:
+    """True only when the whole cell is a summary/total label (keyword + optional
+    unit words and trailing punctuation), so customer names that merely START
+    with a keyword don't false-match."""
+    if not isinstance(value, str):
+        return False
+    s = value.strip().lower().rstrip(":").strip()
+    if not s:
+        return False
+    for term in _SUMMARY_TERMS:
+        if re.match(rf"^{re.escape(term)}{_SUMMARY_SUFFIX}\s*$", s):
+            return True
+    return False
+
+
+# Rollforward / movement section labels that sometimes sit *inside* the customer
+# column (above or below the customer rows) but are NOT customers. Matched
+# position-agnostically — we never assume sections live at the top or bottom.
+_MOVEMENT_TERMS = (
+    "new", "net new", "upsell", "up-sell", "expansion", "expand",
+    "downsell", "down-sell", "contraction", "contract", "churn", "churned",
+    "gross churn", "net churn", "movement", "delta", "pipeline", "bookings",
+    "beginning", "opening", "starting", "ending", "closing", "logo",
+    "gross retention", "net retention", "grr", "nrr", "retention",
+    "reactivation", "resurrection", "winback", "win-back", "reverse",
+    "existing",
+)
+# Only allow a small set of trailing words so we match "New customers" / "Churn
+# MRR" but NOT a real customer named "New Relic" or "Churnzero Inc".
+_MOVEMENT_SUFFIX = r"(?:\s+(?:customers?|revenue|mrr|arr|acv|logos?|accounts?|rate|%|\$))*"
+
+
+def is_movement_label(value: Any) -> bool:
+    """True if the label is a rollforward/movement section header (anchored to
+    the whole cell, so it won't fire on company names that merely start with a
+    movement word)."""
     if not isinstance(value, str):
         return False
     s = value.strip().lower()
     if not s:
         return False
-    for p in SUMMARY_LABEL_PATTERNS:
-        if re.match(p, s):
+    for term in _MOVEMENT_TERMS:
+        if re.match(rf"^{re.escape(term)}{_MOVEMENT_SUFFIX}\s*$", s):
             return True
     return False
+
+
+def is_non_customer_label(value: Any) -> bool:
+    """A row whose customer-column label is a summary OR a movement-section
+    label is not a customer, regardless of where it sits on the sheet."""
+    return is_summary_label(value) or is_movement_label(value)
+
+
+def _row_has_monthly_data(ws, r: int, source_first_col: int, source_last_col: int) -> bool:
+    """True if row r carries at least one numeric value across the source date
+    columns. This is what separates a real customer row from a dataless label
+    (a segment sub-header like 'Enterprise', a spacer, a stray note) that merely
+    happens to have text in the customer column."""
+    if not source_first_col or not source_last_col:
+        return False
+    for c in range(source_first_col, source_last_col + 1):
+        v = ws.cell(row=r, column=c).value
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return True
+    return False
+
+
+def _detect_total_rows(ws, rows: list[int], source_first_col: int,
+                       source_last_col: int, rel_tol: float = 0.005) -> list[int]:
+    """Flag any row in `rows` whose per-month values equal the SUM of all the
+    OTHER rows' values across the source months — i.e. a column-total row that
+    slipped into the customer block without a label our vocabulary recognizes.
+
+    Vocabulary-independent and conservative: requires at least 3 OTHER rows (so
+    a single big customer that coincidentally equals the sum of two others is
+    not mistaken for a total), the match to hold across every month the row has
+    data (>=2 months), and exactly ONE row claiming to be the total of the rest
+    (otherwise it's ambiguous — all-equal rows, nested subtotals — so we don't
+    guess)."""
+    if len(rows) < 4 or not source_first_col or not source_last_col:
+        return []
+    ncols = source_last_col - source_first_col + 1
+    vals: dict[int, list[float]] = {}
+    for r in rows:
+        rv = []
+        for c in range(source_first_col, source_last_col + 1):
+            v = ws.cell(row=r, column=c).value
+            rv.append(float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0)
+        vals[r] = rv
+    col_total = [sum(vals[r][j] for r in rows) for j in range(ncols)]
+
+    totals: list[int] = []
+    for r in rows:
+        checked = 0
+        matched = 0
+        for j in range(ncols):
+            mine = vals[r][j]
+            others = col_total[j] - mine
+            if abs(mine) < 1e-9 and abs(others) < 1e-9:
+                continue
+            checked += 1
+            if abs(mine - others) <= rel_tol * max(abs(mine), 1.0):
+                matched += 1
+        if checked >= 2 and matched == checked:
+            totals.append(r)
+    return totals if len(totals) == 1 else []
+
+
+def _split_runs_by_blanks(candidate_rows: list[int], blank_rows: set) -> list[list[int]]:
+    """Split an ordered list of candidate customer rows into runs, breaking a run
+    wherever a blank customer-column row sits between two consecutive candidates.
+    Blank rows are the cleanest, label-independent block boundary: a top/bottom
+    roll-up cluster is almost always separated from the real customer list by one
+    or more blank rows."""
+    runs: list[list[int]] = []
+    current: list[int] = []
+    for r in candidate_rows:
+        if current and any(b in blank_rows for b in range(current[-1] + 1, r)):
+            runs.append(current)
+            current = []
+        current.append(r)
+    if current:
+        runs.append(current)
+    return runs
+
+
+def classify_customer_rows(ws, header_row: int, customer_col: int | None,
+                           source_first_col: int, source_last_col: int) -> tuple[list[int], list[dict], list[dict]]:
+    """Split the rows below the header into real customer rows, section/summary
+    rows, and excluded non-customer clusters.
+
+    A row is a *candidate* customer only when its customer-column cell is
+    non-empty, is NOT a summary/movement label, AND it carries monthly data (at
+    least one numeric value across the source date columns) — the monthly-data
+    requirement drops dataless label rows (segment sub-headers, spacers).
+
+    Candidates are grouped into runs separated by blank rows. Every run that is
+    comparably large (>= 25% of the biggest, or the biggest itself) is kept and
+    merged into the customer block — so a stray/cosmetic blank inside a real
+    customer list does NOT lop off half of it. Small runs that sit apart from the
+    data (a roll-up/summary cluster, whose labels may be too verbose to
+    pattern-match) are dropped and reported in excluded_clusters. Finally a
+    structural total-row guard removes any kept row whose values equal the sum of
+    the others (a column total that slipped in without a recognizable label).
+
+    Returns (customer_rows, section_rows, excluded_clusters) where
+    section_rows = [{row, label[, reason]}] and
+    excluded_clusters = [{first_row, last_row, count}]."""
+    customer_rows: list[int] = []
+    section_rows: list[dict] = []
+    excluded_clusters: list[dict] = []
+    if customer_col is None:
+        return customer_rows, section_rows, excluded_clusters
+
+    candidates: list[int] = []
+    blank_rows: set = set()
+    for r in range(header_row + 1, ws.max_row + 1):
+        v = ws.cell(row=r, column=customer_col).value
+        if v in (None, ""):
+            blank_rows.add(r)
+            continue
+        if is_non_customer_label(v):
+            section_rows.append({"row": r, "label": str(v).strip()})
+            continue
+        if not _row_has_monthly_data(ws, r, source_first_col, source_last_col):
+            # Named, but no monthly data → a sub-header / segment label / spacer,
+            # not a customer. Skip it (it anchors nothing).
+            continue
+        candidates.append(r)
+
+    if not candidates:
+        return customer_rows, section_rows, excluded_clusters
+
+    runs = _split_runs_by_blanks(candidates, blank_rows)
+    largest = max(len(r) for r in runs)
+    # Keep every run that is comparably large (>= 25% of the biggest, min 3) OR is
+    # itself the biggest. This merges a real customer list back together when a
+    # stray/cosmetic blank row splits it, while still dropping a small summary
+    # cluster that sits apart from the data. Small runs are reported, never
+    # silently swallowed.
+    keep_threshold = max(3, 0.25 * largest)
+    kept_rows: list[int] = []
+    for run in runs:
+        if len(run) >= keep_threshold or len(run) == largest:
+            kept_rows.extend(run)
+        else:
+            excluded_clusters.append(
+                {"first_row": run[0], "last_row": run[-1], "count": len(run)}
+            )
+    kept_rows.sort()
+
+    customer_rows = kept_rows
+    # Structural total-row guard: drop a column-total row that slipped into the
+    # block without a recognizable label (caught by summation, not vocabulary).
+    total_rows = _detect_total_rows(ws, customer_rows, source_first_col, source_last_col)
+    if total_rows:
+        total_set = set(total_rows)
+        customer_rows = [r for r in customer_rows if r not in total_set]
+        for r in total_rows:
+            lbl = ws.cell(row=r, column=customer_col).value
+            section_rows.append({
+                "row": r,
+                "label": str(lbl).strip() if lbl not in (None, "") else "(unlabeled)",
+                "reason": "values equal the sum of the other rows — looks like a column total",
+            })
+        section_rows.sort(key=lambda x: x["row"])
+    return customer_rows, section_rows, excluded_clusters
 
 
 def looks_like_date(value: Any) -> bool:
@@ -401,15 +559,14 @@ def detect_derived_blocks(ws, header_row: int, source_first_col: int, source_las
 
 def detect_negatives(ws, header_row: int, customer_col: int | None,
                      source_first_col: int, source_last_col: int,
-                     summary_rows: list[dict]) -> list[dict]:
-    """Walk the source MRR block and flag negative numeric values."""
-    summary_row_set = {sr["row"] for sr in summary_rows}
+                     customer_row_set: set) -> list[dict]:
+    """Walk the source block and flag negative numeric values, tagging each by
+    whether it falls in a real customer row vs a section/summary row. Negatives
+    in section rows (e.g. a "Churn" or "Contraction" line) are expected and
+    should not force a user decision — only customer-row negatives matter."""
     out = []
     data_start = header_row + 1
     for r in range(data_start, ws.max_row + 1):
-        if r in summary_row_set:
-            continue
-        # If customer_col is set and that cell is empty, treat as not-a-data-row
         if customer_col is not None:
             cust_val = ws.cell(row=r, column=customer_col).value
             if cust_val in (None, ""):
@@ -425,6 +582,7 @@ def detect_negatives(ws, header_row: int, customer_col: int | None,
                     "col_letter": get_column_letter(c),
                     "value": float(v),
                     "customer": cust_val,
+                    "in_customer_row": r in customer_row_set,
                 })
     return out
 
@@ -561,7 +719,8 @@ def hypothesize_shape(ws, header_row: int, source_first_col: int,
 # Per-sheet inspection
 # ---------------------------------------------------------------------------
 
-def inspect_sheet(ws) -> dict:
+def inspect_sheet(ws, as_of: dt.date | None = None) -> dict:
+    as_of = as_of or dt.date.today()
     name = ws.title
     rows = ws.max_row
     cols = ws.max_column
@@ -607,10 +766,19 @@ def inspect_sheet(ws) -> dict:
     # Summary rows (within source block).
     summary_rows = detect_summary_rows(ws, customer_col_index)
 
-    # Negative values inside source block.
-    negatives = detect_negatives(
-        ws, header_row, customer_col_index, source_first_col, source_last_col, summary_rows
+    # Position-agnostic split of rows below the header into real customers vs
+    # section/summary rows (works whether sections sit above, below, or among
+    # the customer rows — never assumes a fixed position).
+    customer_rows, section_rows_in_col, excluded_clusters = classify_customer_rows(
+        ws, header_row, customer_col_index, source_first_col, source_last_col
     )
+    customer_row_set = set(customer_rows)
+
+    # Negative values, tagged customer-row vs section-row.
+    negatives = detect_negatives(
+        ws, header_row, customer_col_index, source_first_col, source_last_col, customer_row_set
+    )
+    customer_negatives = [n for n in negatives if n.get("in_customer_row")]
 
     # Scale verdict.
     scale = assess_scale(ws, header_row, source_first_col, source_last_col, summary_rows)
@@ -620,22 +788,52 @@ def inspect_sheet(ws) -> dict:
         ws, header_row, source_first_col, source_last_col, blocks, name
     )
 
-    # Customer-row count = number of non-summary, customer-col-non-empty rows
-    # below the header. Only meaningful when this looks like source data.
+    # Customer count + contiguous range, excluding section rows. Only meaningful
+    # when this looks like source data.
     customer_count = None
+    customer_row_range = None
     if role == "source data" and customer_col_index:
-        summary_row_set = {sr["row"] for sr in summary_rows}
-        cnt = 0
-        for r in range(header_row + 1, ws.max_row + 1):
-            if r in summary_row_set:
-                continue
-            v = ws.cell(row=r, column=customer_col_index).value
-            if v not in (None, ""):
-                cnt += 1
-        customer_count = cnt
+        customer_count = len(customer_rows)
+        if customer_rows:
+            first_r, last_r = customer_rows[0], customer_rows[-1]
+            customer_row_range = {
+                "first_row": first_r,
+                "last_row": last_r,
+                "contiguous": (last_r - first_r + 1) == len(customer_rows),
+                "section_rows_excluded": len(section_rows_in_col),
+            }
 
-    # Per-sheet sufficiency verdict.
-    sheet_suff = sheet_sufficiency(role, customer_count, date_count, negatives)
+    # Forecast / incompleteness detection. The current calendar month is still
+    # IN PROGRESS, so it is NOT a complete booked actual — the last complete
+    # month is the one *before* as_of's month (e.g. as_of Jun-26 → last complete
+    # is May-26). Any column in the current month or later (genuine future) is
+    # flagged as not-a-complete-actual. `as_of` is injectable so this stays
+    # deterministic under test; production defaults to today.
+    def _is_incomplete(d: dt.date) -> bool:
+        return (d.year, d.month) >= (as_of.year, as_of.month)
+
+    future_cols = [
+        {
+            "col_letter": get_column_letter(c),
+            "month": fmt_month(d),
+            "kind": (
+                "current-month-in-progress"
+                if (d.year, d.month) == (as_of.year, as_of.month)
+                else "future"
+            ),
+        }
+        for (c, d) in date_run if _is_incomplete(d)
+    ]
+    complete_dates = [d for (c, d) in date_run if not _is_incomplete(d)]
+    forecast = {
+        "as_of": as_of.isoformat(),
+        "future_columns": future_cols,
+        "actuals_through": fmt_month(max(complete_dates)) if complete_dates else None,
+    }
+
+    # Per-sheet sufficiency verdict (only customer-row negatives gate it).
+    sheet_suff = sheet_sufficiency(role, customer_count, date_count,
+                                   customer_negatives, future_cols)
 
     # Derived-block list excludes the source block.
     derived_blocks = [b for b in blocks if b["type"] != "source"]
@@ -662,13 +860,20 @@ def inspect_sheet(ws) -> dict:
         "derived_blocks_detected": derived_blocks,
         "negative_values": negatives,
         "customer_count_hypothesis": customer_count,
+        "customer_row_range": customer_row_range,
+        "section_rows_in_customer_col": section_rows_in_col,
+        "excluded_row_clusters": excluded_clusters,
+        "forecast": forecast,
         "sufficiency": sheet_suff,
     }
 
 
 def sheet_sufficiency(role: str, customer_count: int | None,
-                      date_count: int, negatives: list[dict]) -> dict:
-    """Per-sheet sufficiency for retention analysis."""
+                      date_count: int, customer_negatives: list[dict],
+                      future_cols: list[dict] | None = None) -> dict:
+    """Per-sheet sufficiency for retention analysis. Only customer-row negatives
+    are surfaced; section-row negatives (e.g. a 'Churn' line) are expected."""
+    future_cols = future_cols or []
     if role != "source data":
         return {
             "verdict": "n/a",
@@ -684,8 +889,14 @@ def sheet_sufficiency(role: str, customer_count: int | None,
             f"Only {date_count} months — LTM (last twelve months) retention will not be available; "
             "monthly-only with the limitation called out."
         )
-    if negatives:
-        caveats.append(f"{len(negatives)} negative value(s) in source block — discuss treatment with user.")
+    if customer_negatives:
+        caveats.append(f"{len(customer_negatives)} negative value(s) in customer rows — discuss treatment with user.")
+    if future_cols:
+        caveats.append(
+            f"{len(future_cols)} month column(s) are not complete actuals "
+            f"({future_cols[0]['month']} onward — the current month is still in progress and/or "
+            "later months are forecast). Confirm the actuals cutoff with the user."
+        )
     if caveats:
         return {"verdict": "pass-with-caveats", "reason": " ".join(caveats)}
     return {
@@ -701,7 +912,7 @@ def sheet_sufficiency(role: str, customer_count: int | None,
 # CSV inspection
 # ---------------------------------------------------------------------------
 
-def inspect_csv(path: str) -> dict:
+def inspect_csv(path: str, as_of: dt.date | None = None) -> dict:
     """
     CSV path handling. We support two CSV shapes:
       1. Wide (customer per row, date columns)  → wrap into a one-sheet workbook view.
@@ -775,7 +986,7 @@ def inspect_csv(path: str) -> dict:
             except Exception:
                 cast = val
             ws.cell(row=r_idx, column=c_idx).value = cast
-    sheet_report = inspect_sheet(ws)
+    sheet_report = inspect_sheet(ws, as_of=as_of)
     return {
         "file": path,
         "sheets": [sheet_report],
@@ -787,14 +998,17 @@ def inspect_csv(path: str) -> dict:
 # Top-level inspect
 # ---------------------------------------------------------------------------
 
-def inspect_file(path: str) -> dict:
+def inspect_file(path: str, as_of: dt.date | None = None) -> dict:
     """Two-pass survey: cheap score every sheet, then deep-inspect only the
     top candidate (plus any close runner-up). Skips sheets that clearly aren't
     the source customer × month matrix so we don't waste time profiling
     pre-built dashboards, instructions, etc.
+
+    `as_of` is injectable (defaults to today) so the forecast/current-month
+    detection is deterministic under test.
     """
     if path.lower().endswith(".csv"):
-        return inspect_csv(path)
+        return inspect_csv(path, as_of=as_of)
     if not path.lower().endswith((".xlsx", ".xlsm")):
         raise ValueError(f"Unsupported file extension: {path}. Provide .xlsx or .csv.")
     wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
@@ -821,7 +1035,7 @@ def inspect_file(path: str) -> dict:
         near_tie = len(deep_names) > 1
 
     # Pass 2: deep inspect the chosen sheet(s) only.
-    sheet_reports = [inspect_sheet(wb[name]) for name in deep_names]
+    sheet_reports = [inspect_sheet(wb[name], as_of=as_of) for name in deep_names]
 
     # Skipped sheets: everything we didn't deep-inspect, with their Pass-1
     # signals so the model can show them to the user when relevant.
@@ -907,6 +1121,37 @@ def render_text(report: dict) -> str:
 
         if s.get("customer_count_hypothesis") is not None:
             lines.append(f"  Customer-row count (HYP): {s['customer_count_hypothesis']}")
+        crr = s.get("customer_row_range")
+        if crr:
+            note = "contiguous" if crr["contiguous"] else "NON-contiguous"
+            extra = (f", {crr['section_rows_excluded']} section row(s) excluded"
+                     if crr["section_rows_excluded"] else "")
+            lines.append(
+                f"  Customer block (HYP): rows {crr['first_row']}-{crr['last_row']} "
+                f"({note}{extra})"
+            )
+        sect = s.get("section_rows_in_customer_col") or []
+        if sect:
+            labels = ", ".join(f"row {x['row']}:{x['label']!r}" for x in sect[:6])
+            lines.append(f"  Section rows inside the customer column (NOT customers): {labels}")
+        excl = s.get("excluded_row_clusters") or []
+        if excl:
+            clusters = ", ".join(
+                f"rows {x['first_row']}-{x['last_row']} ({x['count']})" for x in excl
+            )
+            lines.append(
+                f"  Excluded non-customer cluster(s) — separated from the customer "
+                f"block by blank rows (likely a summary/roll-up block): {clusters}"
+            )
+
+        fc = s.get("forecast") or {}
+        if fc.get("future_columns"):
+            cols = ", ".join(x["month"] for x in fc["future_columns"])
+            lines.append(
+                f"  Incomplete/forecast tail (HYP): {len(fc['future_columns'])} month(s) are not "
+                f"complete actuals ({cols}; current month in progress and/or later months forecast) "
+                f"— last complete actual appears to be {fc.get('actuals_through')}. Confirm cutoff."
+            )
 
         scale = s["scale_signal"]
         lines.append(f"  Scale signal (HYP): {scale['verdict']} — {scale['evidence']}")
@@ -925,16 +1170,24 @@ def render_text(report: dict) -> str:
         else:
             lines.append("  Derived blocks detected: none")
 
-        if s["negative_values"]:
-            lines.append(f"  Negative values flagged ({len(s['negative_values'])}):")
-            for n in s["negative_values"][:10]:
+        negs = s["negative_values"]
+        cust_negs = [n for n in negs if n.get("in_customer_row")]
+        sect_negs = [n for n in negs if not n.get("in_customer_row")]
+        if cust_negs:
+            lines.append(f"  Negatives in CUSTOMER rows ({len(cust_negs)}) — need a user decision:")
+            for n in cust_negs[:10]:
                 lines.append(
                     f"    - {n['col_letter']}{n['row']} = {n['value']:,.2f} (customer={n['customer']!r})"
                 )
-            if len(s["negative_values"]) > 10:
-                lines.append(f"    ... and {len(s['negative_values']) - 10} more")
+            if len(cust_negs) > 10:
+                lines.append(f"    ... and {len(cust_negs) - 10} more")
         else:
-            lines.append("  Negative values flagged: none")
+            lines.append("  Negatives in customer rows: none")
+        if sect_negs:
+            lines.append(
+                f"  Negatives in section/summary rows ({len(sect_negs)}): expected "
+                "(e.g. a Churn/Contraction line) — no user decision needed."
+            )
 
         suf = s["sufficiency"]
         lines.append(f"  Sheet sufficiency: {suf['verdict'].upper()} — {suf['reason']}")
@@ -968,7 +1221,7 @@ def render_text(report: dict) -> str:
 # ---------------------------------------------------------------------------
 
 # Path to the bundled synthetic test fixture. Resolved relative to this file so
-# it works whether the skill is run from ~/.claude/skills/ or a fresh clone.
+# it works whether the skill runs from an agent's skills folder or a fresh clone.
 DEFAULT_FIXTURE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "fixtures",
@@ -984,7 +1237,10 @@ def run_self_test(path: str | None = None) -> int:
         print(f"FAIL — test target not found: {target}")
         return 1
 
-    report = inspect_file(target)
+    # Pin as_of to just after the fixture's last month (Jun-26) so all 18 months
+    # read as complete actuals — keeps the fixture assertions deterministic
+    # regardless of the real calendar date the test runs on.
+    report = inspect_file(target, as_of=dt.date(2026, 7, 15))
     print(render_text(report))
     print()
 
@@ -1077,6 +1333,23 @@ def run_self_test(path: str | None = None) -> int:
                 f"Raw Data: customer_count_hypothesis expected 10, got "
                 f"{raw.get('customer_count_hypothesis')!r}"
             )
+        # Customer block: rows 8-17, contiguous, no section rows in the column.
+        crr = raw.get("customer_row_range")
+        if not crr or crr.get("first_row") != 8 or crr.get("last_row") != 17:
+            failures.append(f"Raw Data: customer_row_range expected rows 8-17, got {crr!r}")
+        if crr and not crr.get("contiguous"):
+            failures.append("Raw Data: customer block expected contiguous")
+        if raw.get("section_rows_in_customer_col"):
+            failures.append(
+                f"Raw Data: expected no section rows in customer column, got "
+                f"{raw.get('section_rows_in_customer_col')!r}"
+            )
+        # Fixture is historical (ends Jun-25/26) → no forecast columns.
+        if (raw.get("forecast") or {}).get("future_columns"):
+            failures.append(
+                f"Raw Data: expected no forecast columns, got "
+                f"{(raw.get('forecast') or {}).get('future_columns')!r}"
+            )
         if raw["sufficiency"]["verdict"] != "pass":
             failures.append(f"Raw Data: sufficiency expected 'pass', got "
                             f"{raw['sufficiency']['verdict']!r}")
@@ -1115,6 +1388,208 @@ def run_self_test(path: str | None = None) -> int:
             f"{report['overall_sufficiency']['verdict']!r}"
         )
 
+    # =====================================================================
+    # ADVERSARIAL BATTERY — exercises the customer-block detector and the
+    # forecast/current-month logic against shape variations the single bundled
+    # fixture does NOT cover. Each case is a compact spec; we build a sheet,
+    # run inspect_sheet, and assert. The point is to prove the heuristics
+    # generalise, not just fit the one workbook that prompted them.
+    # =====================================================================
+    def D(y, m):
+        return dt.date(y, m, 1)
+
+    FAR = dt.date(2099, 12, 1)  # default as_of → every test month is a complete actual
+
+    def _build_battery_sheet(spec):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = spec["name"][:31]
+        ws.cell(row=1, column=1, value="Customer")
+        for j, d in enumerate(spec["dates"]):
+            ws.cell(row=1, column=2 + j, value=d)
+        for i, (label, vals) in enumerate(spec["rows"]):
+            r = 2 + i
+            if label is not None:
+                ws.cell(row=r, column=1, value=label)
+            for j, v in enumerate(vals or []):
+                if v is not None:
+                    ws.cell(row=r, column=2 + j, value=v)
+        return ws
+
+    M3 = [D(2025, 1), D(2025, 2), D(2025, 3)]
+    M2 = [D(2025, 1), D(2025, 2)]
+
+    battery = [
+        # 1. Clean list, no summary, no blanks.
+        {"name": "Clean", "dates": M3, "rows": [
+            ("Acme", [1000, 1100, 1200]), ("Globex", [500, 600, 600]),
+            ("Initech", [1500, 1400, 1450]), ("Umbrella", [300, 300, 350]),
+        ], "expect": {"first": 2, "last": 5, "count": 4, "excluded": 0, "sections": set()}},
+
+        # 2. Summary block ABOVE + blank gap, with a verbose unmatched line (the
+        #    real-world shape that prompted this work).
+        {"name": "SummaryAbove", "dates": M3, "rows": [
+            ("Summary", [3000, 3100, 3200]),
+            ("Pipeline to be signed / unidentified changes", [0, -250, 0]),
+            ("Total", [3000, 2850, 3200]),
+            (None, None), (None, None),
+            ("Acme", [1000, 1100, 1200]), ("Globex", [500, 600, 600]),
+            ("Initech", [1500, 1150, 1400]),
+        ], "expect": {"first": 7, "last": 9, "count": 3, "excluded_min": 1,
+                       "sections_superset": {"Summary", "Total"}, "cust_neg": 0}},
+
+        # 3. Summary block BELOW + blank gap.
+        {"name": "SummaryBelow", "dates": M2, "rows": [
+            ("Acme", [1000, 1100]), ("Globex", [500, 600]), ("Initech", [1500, 1400]),
+            (None, None),
+            ("Total", [3000, 3100]), ("Memo: pipeline", [200, 200]),
+        ], "expect": {"first": 2, "last": 4, "count": 3, "excluded_min": 1,
+                       "sections_superset": {"Total"}}},
+
+        # 4. Summary clusters at BOTH ends.
+        {"name": "SummaryBothEnds", "dates": M2, "rows": [
+            ("Total", [9999, 9999]), ("Memo top", [100, 100]),
+            (None, None),
+            ("Acme", [1000, 1100]), ("Globex", [500, 600]),
+            ("Initech", [1500, 1400]), ("Umbrella", [300, 350]),
+            (None, None),
+            ("Memo bottom", [50, 50]),
+        ], "expect": {"first": 5, "last": 8, "count": 4, "excluded": 2}},
+
+        # 5. Summary directly above, NO blank, but RECOGNISED labels → sections.
+        {"name": "NoBlankLabeled", "dates": M2, "rows": [
+            ("Total MRR", [3000, 3100]), ("Summary", [3000, 3100]),
+            ("Acme", [1000, 1100]), ("Globex", [500, 600]), ("Initech", [1500, 1400]),
+        ], "expect": {"first": 4, "last": 6, "count": 3, "excluded": 0,
+                       "sections_superset": {"Total MRR", "Summary"}}},
+
+        # 6. Hidden TOTAL at top, NO blank, VERBOSE unmatched label → caught by
+        #    the structural summation guard (signal E), not the vocabulary.
+        {"name": "HiddenTotalTop", "dates": M2, "rows": [
+            ("Consolidated book (all accounts)", [3000, 3100]),
+            ("Acme", [1000, 1100]), ("Globex", [500, 600]), ("Initech", [1500, 1400]),
+        ], "expect": {"first": 3, "last": 5, "count": 3,
+                       "total_label": "Consolidated book (all accounts)"}},
+
+        # 7. Hidden TOTAL at bottom, NO blank, verbose label.
+        {"name": "HiddenTotalBottom", "dates": M2, "rows": [
+            ("Acme", [1000, 1100]), ("Globex", [500, 600]), ("Initech", [1500, 1400]),
+            ("Roll-up of the above", [3000, 3100]),
+        ], "expect": {"first": 2, "last": 4, "count": 3,
+                       "total_label": "Roll-up of the above"}},
+
+        # 8. Section rows interspersed AMONG customers (no blanks). "New Relic"
+        #    must NOT be read as a 'new' movement row; negatives tagged correctly.
+        {"name": "Interspersed", "dates": M3, "rows": [
+            ("Acme", [1000, -100, 1100]),       # customer-row negative
+            ("Globex", [500, 600, 600]),
+            ("New Relic", [900, 900, 900]),     # keyword-like name, real customer
+            ("Churn", [0, -500, 0]),            # section-row negative
+            ("Contraction", [0, -300, 0]),      # section-row negative
+        ], "expect": {"count": 3, "sections_superset": {"Churn", "Contraction"},
+                       "not_sections": {"New Relic"}, "cust_neg": 1, "sect_neg": 2}},
+
+        # 9. RISK CASE: a real customer list split by a stray internal blank row.
+        #    Must MERGE (not lop off half), reported non-contiguous, none excluded.
+        {"name": "InternalBlank", "dates": M2, "rows": [
+            ("Acme", [1000, 1100]), ("Bravo", [500, 600]), ("Cosmo", [1500, 1400]),
+            (None, None),
+            ("Dover", [800, 800]), ("Echo", [700, 700]), ("Foxtrot", [600, 600]),
+        ], "expect": {"first": 2, "last": 8, "count": 6, "excluded": 0,
+                       "contiguous": False}},
+
+        # 10. Customer names that START with summary/movement keywords. None may
+        #     be misread as a section (tests whole-cell label matching).
+        {"name": "KeywordNames", "dates": M2, "rows": [
+            ("Total Wine & More", [1000, 1100]), ("Sum Ventures", [500, 600]),
+            ("New Relic", [300, 400]), ("Net Health", [200, 250]),
+        ], "expect": {"count": 4, "sections": set()}},
+
+        # 11. Single customer.
+        {"name": "SingleCustomer", "dates": M3, "rows": [
+            ("OnlyCo", [1000, 1100, 1200]),
+        ], "expect": {"count": 1, "first": 2, "last": 2}},
+
+        # 12. Current-month boundary: as_of mid-March → Mar is in-progress, last
+        #     complete actual is Feb.
+        {"name": "CurrentMonth", "dates": [D(2026, 1), D(2026, 2), D(2026, 3)],
+         "as_of": dt.date(2026, 3, 10), "rows": [
+            ("Acme", [1000, 1100, 1200]), ("Globex", [500, 600, 600]),
+            ("Initech", [1500, 1400, 1450]),
+        ], "expect": {"count": 3, "actuals_through": "Feb-26", "future_count": 1}},
+
+        # 13. Forecast tail + current month (the user's scenario): as_of Jun-2026,
+        #     data runs to Dec-2026 → last complete actual is May-26; Jun + Jul..Dec
+        #     are not complete (7 columns).
+        {"name": "ForecastTail",
+         "dates": [D(2026, m) for m in range(1, 13)],
+         "as_of": dt.date(2026, 6, 15), "rows": [
+            ("Acme", [1000] * 12), ("Globex", [500] * 12), ("Initech", [1500] * 12),
+        ], "expect": {"count": 3, "actuals_through": "May-26", "future_count": 7}},
+
+        # 14. All months strictly in the past → no incomplete columns.
+        {"name": "AllPast", "dates": [D(2023, 1), D(2023, 2), D(2023, 3)],
+         "as_of": dt.date(2026, 6, 15), "rows": [
+            ("Acme", [1000, 1100, 1200]), ("Globex", [500, 600, 600]),
+            ("Initech", [1500, 1400, 1450]),
+        ], "expect": {"count": 3, "actuals_through": "Mar-23", "future_count": 0}},
+
+        # 15. Dataless label row (segment sub-header) between header and the first
+        #     real customer — must NOT anchor the block.
+        {"name": "DatalessLeadLabel", "dates": M3, "rows": [
+            ("Enterprise", None),
+            ("Acme", [1000, 1100, 1200]), ("Globex", [500, 600, 600]),
+            ("Initech", [1500, 1400, 1450]),
+        ], "expect": {"first": 3, "last": 5, "count": 3}},
+    ]
+
+    for spec in battery:
+        nm = spec["name"]
+        ws_b = _build_battery_sheet(spec)
+        rep = inspect_sheet(ws_b, as_of=spec.get("as_of", FAR))
+        exp = spec["expect"]
+        crr = rep.get("customer_row_range") or {}
+        secs = {x["label"] for x in rep.get("section_rows_in_customer_col", [])}
+        excl = rep.get("excluded_row_clusters") or []
+        fc = rep.get("forecast") or {}
+        negs = rep.get("negative_values") or []
+
+        if "count" in exp and rep.get("customer_count_hypothesis") != exp["count"]:
+            failures.append(f"[{nm}] count expected {exp['count']}, got {rep.get('customer_count_hypothesis')}")
+        if "first" in exp and crr.get("first_row") != exp["first"]:
+            failures.append(f"[{nm}] first_row expected {exp['first']}, got {crr.get('first_row')}")
+        if "last" in exp and crr.get("last_row") != exp["last"]:
+            failures.append(f"[{nm}] last_row expected {exp['last']}, got {crr.get('last_row')}")
+        if "contiguous" in exp and crr.get("contiguous") != exp["contiguous"]:
+            failures.append(f"[{nm}] contiguous expected {exp['contiguous']}, got {crr.get('contiguous')}")
+        if "excluded" in exp and len(excl) != exp["excluded"]:
+            failures.append(f"[{nm}] excluded clusters expected {exp['excluded']}, got {len(excl)} ({excl})")
+        if "excluded_min" in exp and len(excl) < exp["excluded_min"]:
+            failures.append(f"[{nm}] excluded clusters expected >= {exp['excluded_min']}, got {len(excl)}")
+        if "sections" in exp and secs != exp["sections"]:
+            failures.append(f"[{nm}] sections expected {exp['sections']}, got {secs}")
+        if "sections_superset" in exp and not exp["sections_superset"].issubset(secs):
+            failures.append(f"[{nm}] sections missing {exp['sections_superset'] - secs} (got {secs})")
+        if "not_sections" in exp and (exp["not_sections"] & secs):
+            failures.append(f"[{nm}] these were wrongly classified as sections: {exp['not_sections'] & secs}")
+        if "total_label" in exp:
+            total_secs = {x["label"] for x in rep.get("section_rows_in_customer_col", []) if x.get("reason")}
+            if exp["total_label"] not in total_secs:
+                failures.append(f"[{nm}] expected total-row {exp['total_label']!r} flagged via summation, got {total_secs}")
+        if "cust_neg" in exp:
+            got = len([n for n in negs if n.get("in_customer_row")])
+            if got != exp["cust_neg"]:
+                failures.append(f"[{nm}] customer-row negatives expected {exp['cust_neg']}, got {got}")
+        if "sect_neg" in exp:
+            got = len([n for n in negs if not n.get("in_customer_row")])
+            if got != exp["sect_neg"]:
+                failures.append(f"[{nm}] section-row negatives expected {exp['sect_neg']}, got {got}")
+        if "actuals_through" in exp and fc.get("actuals_through") != exp["actuals_through"]:
+            failures.append(f"[{nm}] actuals_through expected {exp['actuals_through']}, got {fc.get('actuals_through')}")
+        if "future_count" in exp and len(fc.get("future_columns", [])) != exp["future_count"]:
+            failures.append(f"[{nm}] future/incomplete cols expected {exp['future_count']}, got {len(fc.get('future_columns', []))}")
+
+    print(f"[battery] ran {len(battery)} adversarial cases")
     print("=" * 78)
     if failures:
         print(f"SELF-TEST: FAIL  ({len(failures)} assertion(s) failed)")
@@ -1142,6 +1617,31 @@ def run_self_test(path: str | None = None) -> int:
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+def build_deliver_config(report: dict) -> dict | None:
+    """Pick the 'source data' sheet and emit the exact params deliver.py needs,
+    so its findings flow straight into the delivery step (no hand-copied flags)."""
+    src = next(
+        (s for s in report.get("sheets", [])
+         if s.get("hypothesis", {}).get("role") == "source data"),
+        None,
+    )
+    if not src:
+        return None
+    cc = src.get("candidate_customer_column") or {}
+    dc = src.get("candidate_date_columns") or {}
+    crr = src.get("customer_row_range") or {}
+    fc = src.get("forecast") or {}
+    return {
+        "source_sheet": src.get("name"),
+        "source_customer_col": cc.get("col_letter"),
+        "source_first_data_row": crr.get("first_row"),
+        "source_last_data_row": crr.get("last_row"),
+        "source_first_date_col": dc.get("first_col_letter"),
+        "source_header_row": dc.get("header_row"),
+        "actuals_through": fc.get("actuals_through"),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Retention-analysis Phase 1-4 inspector. Produces hypotheses; "
@@ -1155,6 +1655,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--self-test", action="store_true",
                    help="Run built-in self-test against the bundled sample fixture "
                         "(or a supplied path, if given)")
+    p.add_argument("--emit-config", metavar="PATH",
+                   help="Write the source-sheet params deliver.py needs to a JSON "
+                        "file (feed it back via deliver.py --config PATH)")
     args = p.parse_args(argv)
 
     if args.self_test:
@@ -1168,6 +1671,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: file not found: {args.path}", file=sys.stderr)
         return 2
 
+    _t0 = time.perf_counter()
     report = inspect_file(args.path)
     if args.json:
         # JSON-safe: convert any datetime customer values, etc.
@@ -1178,6 +1682,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, default=default))
     else:
         print(render_text(report))
+    if args.emit_config:
+        cfg = build_deliver_config(report)
+        if cfg is None:
+            print("WARN: no 'source data' sheet found; no config written.",
+                  file=sys.stderr)
+        else:
+            with open(args.emit_config, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=2)
+            print(f"[survey.py] wrote deliver config -> {args.emit_config}",
+                  file=sys.stderr)
+    print(f"[survey.py] inspected in {time.perf_counter() - _t0:.2f}s", file=sys.stderr)
     return 0
 
 

@@ -5,11 +5,10 @@ Takes a long-format CSV with columns (customer_id, month, mrr) and produces a
 JSON-serializable dict containing:
 
   - config         : run configuration + dataset shape
-  - buckets        : per (customer, month) classification + amount
   - monthly        : per-month aggregates (rollforward)
   - metrics_monthly: Gross / Net / Logo retention per month (blank for first month)
   - metrics_ltm    : same metrics on a 12-month-prior basis (only when >=13 months)
-  - verification   : pass/fail per layer (1..8) plus diagnostics
+  - verification   : pass/fail per layer (1..7) plus diagnostics
 
 CLI:
     python3 compute.py <long-format-csv> [--arr-factor 12] [--output result.json]
@@ -23,38 +22,18 @@ LTM only when >=13 months of data.
 
 from __future__ import annotations
 
-# --- sys.path hygiene: defensive guard. When a script runs as __main__, Python
-# prepends its directory to sys.path, which can shadow stdlib modules that share
-# a name with sibling files. Strip the script's directory before importing.
-import os as _os
-import sys as _sys
-
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
-_sys.path[:] = [
-    p for p in _sys.path if not p or _os.path.abspath(p) != _HERE
-]
-# If `inspect` was already partially imported and points at the local copy,
-# drop it so a fresh stdlib import succeeds.
-_inspect_mod = _sys.modules.get("inspect")
-if _inspect_mod is not None:
-    _f = getattr(_inspect_mod, "__file__", "") or ""
-    if _f and _os.path.abspath(_os.path.dirname(_f)) == _HERE:
-        del _sys.modules["inspect"]
-
 import argparse
 import csv
 import json
-import math
 import os
 import sys
-from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
 
 # Path to the bundled synthetic test fixture. Resolved relative to this file so
-# it works whether the skill is run from ~/.claude/skills/ or a fresh clone.
+# it works whether the skill runs from an agent's skills folder or a fresh clone.
 DEFAULT_FIXTURE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "fixtures",
@@ -85,17 +64,6 @@ def _parse_month(value: str) -> str:
 
 def _round2(x: float) -> float:
     return round(x + 0.0, 2)
-
-
-def _add_months(year: int, month: int, delta: int) -> tuple[int, int]:
-    total = year * 12 + (month - 1) + delta
-    return total // 12, (total % 12) + 1
-
-
-def _month_key_minus(month_key: str, delta: int) -> str:
-    y, m = int(month_key[:4]), int(month_key[5:7])
-    yy, mm = _add_months(y, m, -delta)
-    return f"{yy:04d}-{mm:02d}"
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +181,79 @@ def build_matrix(rows: list[LongRow]) -> tuple[list[str], list[str], dict[tuple[
     return months_sorted, customers_sorted, value_lookup, duplicates
 
 
-def compute(rows: list[LongRow], arr_factor: float = 1.0, stated_retention: dict | None = None) -> dict[str, Any]:
+def period_rollforward(months: list[str], customers: list[str], v, lookback: int) -> tuple[list[dict], list[dict]]:
+    """Rollforward + retention at an arbitrary lookback N, matching the deliver.py
+    corkscrew EXACTLY (same SUMPRODUCT masks on raw ARR values — no cohort/min
+    logic). For each comparison period i (i from N to len-1) we compare month i
+    against month i-N:
+
+        Beginning = Σ p           for p>0            (rp>0)
+        New       = Σ q           for p=0, q>0        (rp=0, rc>0)
+        Upsell    = Σ (q-p)       for p>0, q>p        (rp>0, rc>rp)
+        Downsell  = Σ (q-p)       for p>0, 0<q<p      (rp>0, 0<rc<rp)
+        Churn     = Σ (-p)        for p>0, q=0        (rp>0, rc=0)
+        Ending    = Beginning + New + Upsell + Downsell + Churn  (= Σ q for q>0)
+
+    Retention: GRR=(Beg+Down+Churn)/Beg, NRR=(Beg+Up+Down+Churn)/Beg,
+    Logo=(active_prior - churned)/active_prior. N=12 → year-over-year (the
+    deliverable default); N=1 → month-over-month.
+    """
+    rollforward: list[dict] = []
+    metrics: list[dict] = []
+    if lookback < 1 or lookback >= len(months):
+        return rollforward, metrics
+    for i in range(lookback, len(months)):
+        m_curr = months[i]
+        m_prior = months[i - lookback]
+        beginning = new = upsell = downsell = churn = 0.0
+        n_active_prior = n_churned = n_active_curr = n_new = 0
+        for c in customers:
+            p = v(c, m_prior)
+            q = v(c, m_curr)
+            if p > 0:
+                beginning += p
+                n_active_prior += 1
+            if q > 0:
+                n_active_curr += 1
+            if p <= 0 and q > 0:
+                new += q
+                n_new += 1
+            elif p > 0 and q > 0 and q > p:
+                upsell += (q - p)
+            elif p > 0 and q > 0 and q < p:
+                downsell += (q - p)
+            elif p > 0 and q <= 0:
+                churn += -p
+                n_churned += 1
+        ending = beginning + new + upsell + downsell + churn
+        rollforward.append({
+            "month": m_curr,
+            "prior_month": m_prior,
+            "beginning": _round2(beginning),
+            "new": _round2(new),
+            "upsell": _round2(upsell),
+            "downsell": _round2(downsell),
+            "churn": _round2(churn),
+            "ending": _round2(ending),
+            "n_active_prior": n_active_prior,
+            "n_active": n_active_curr,
+            "n_new": n_new,
+            "n_churned": n_churned,
+        })
+        gross = (beginning + downsell + churn) / beginning if beginning > 0 else None
+        net = (beginning + upsell + downsell + churn) / beginning if beginning > 0 else None
+        logo = (n_active_prior - n_churned) / n_active_prior if n_active_prior > 0 else None
+        metrics.append({
+            "month": m_curr,
+            "gross": round(gross, 6) if gross is not None else None,
+            "net": round(net, 6) if net is not None else None,
+            "logo": round(logo, 6) if logo is not None else None,
+        })
+    return rollforward, metrics
+
+
+def compute(rows: list[LongRow], arr_factor: float = 1.0, stated_retention: dict | None = None,
+            lookback: int = 12) -> dict[str, Any]:
     months, customers, lookup, duplicates = build_matrix(rows)
 
     if len(months) < 2:
@@ -228,19 +268,16 @@ def compute(rows: list[LongRow], arr_factor: float = 1.0, stated_retention: dict
         return lookup.get((c, m), 0.0) * af
 
     # ---- Phase 5: bucket math ---------------------------------------------
-    # buckets[(customer, month)] = (bucket_name, amount_in_ARR)
-    buckets: list[dict[str, Any]] = []
+    # bucket_index[(customer, month)] = (bucket_name, amount_in_ARR). Consumed by
+    # the rollforward and the verification battery; not emitted per-row in output.
     bucket_index: dict[tuple[str, str], tuple[str, float]] = {}
 
     # Track per-customer-month negatives (raw input)
     negatives: list[dict[str, Any]] = []
 
     for c in customers:
-        # First month: no prior; we don't classify the very first month per spec
-        # (Beginning of first period = sum of customer revenue in that period;
-        # no movements that period.) But we still want a record for completeness?
-        # The spec's example only shows non-first months in `buckets`. We'll emit
-        # records starting from the second month (delta-based classification).
+        # First month has no prior, so classification starts at the second month
+        # (delta-based). The first month is just the opening balance.
         for i in range(1, len(months)):
             m_prev = months[i - 1]
             m_curr = months[i]
@@ -248,16 +285,6 @@ def compute(rows: list[LongRow], arr_factor: float = 1.0, stated_retention: dict
             current = v(c, m_curr)
             bucket, amount = classify(prior, current)
             bucket_index[(c, m_curr)] = (bucket, amount)
-            buckets.append(
-                {
-                    "customer_id": c,
-                    "month": m_curr,
-                    "bucket": bucket,
-                    "amount": _round2(amount),
-                    "prior_mrr": _round2(prior / af) if af else _round2(prior),
-                    "current_mrr": _round2(current / af) if af else _round2(current),
-                }
-            )
         # Negative-value scan
         for m in months:
             raw = lookup.get((c, m), 0.0)
@@ -396,7 +423,7 @@ def compute(rows: list[LongRow], arr_factor: float = 1.0, stated_retention: dict
     else:
         metrics_ltm = None
 
-    # ---- Phase 7: 8-layer verification battery ----------------------------
+    # ---- Phase 7: 7-layer verification battery ----------------------------
     verification = run_verification(
         months=months,
         customers=customers,
@@ -411,17 +438,27 @@ def compute(rows: list[LongRow], arr_factor: float = 1.0, stated_retention: dict
         stated_retention=stated_retention,
     )
 
+    # ---- Lookback rollforward — matches the deliver.py corkscrew at the same
+    # lookback (default 12 = year-over-year, the deliverable default). This is
+    # what makes compute.py's headline numbers directly comparable to the
+    # spreadsheet's per-period Beginning/New/Upsell/Downsell/Churn/Ending and
+    # GRR/NRR/Logo, so the recalc is a single confirmation pass.
+    rollforward, metrics = period_rollforward(months, customers, v, lookback)
+
     out: dict[str, Any] = {
         "config": {
             "arr_factor": af,
+            "lookback": lookback,
             "n_customers": len(customers),
             "n_months": len(months),
+            "n_periods": len(rollforward),
             "month_range": [months[0], months[-1]],
         },
-        "buckets": buckets,
         "monthly": monthly,
         "metrics_monthly": metrics_monthly,
         "metrics_ltm": metrics_ltm,
+        "rollforward": rollforward,
+        "metrics": metrics,
         "verification": verification,
     }
     return out
@@ -489,123 +526,13 @@ def run_verification(
             layer3_fails.append({"customer": c, "month": m, "issue": f"{bucket} with nonzero amount"})
     layer3 = {"pass": len(layer3_fails) == 0, "failures": layer3_fails}
 
-    # ---- Layer 4: sample-trace 5 customers spanning behaviors
-    samples: list[dict[str, Any]] = []
-    layer4_pass = True
+    # ---- Per-customer monthly value series (shared input to the edge-case scan)
+    trajectories = {c: [v(c, m) for m in months] for c in customers}
 
-    # Helper: classify a customer's overall trajectory
-    def trajectory(c: str) -> dict[str, Any]:
-        ms = [v(c, m) for m in months]
-        nonzero = [x for x in ms if x > 0]
-        return {
-            "first": ms[0],
-            "last": ms[-1],
-            "max": max(ms) if ms else 0,
-            "any_zero": any(x == 0 for x in ms),
-            "any_nonzero": len(nonzero) > 0,
-            "all_equal_when_active": len(set(round(x, 2) for x in ms if x > 0)) <= 1,
-            "values": ms,
-        }
-
-    trajectories = {c: trajectory(c) for c in customers}
-
-    # 1) Never changed: active in first AND last AND all active values equal
-    never_changed = [
-        c for c in customers
-        if trajectories[c]["first"] > 0
-        and trajectories[c]["last"] > 0
-        and not trajectories[c]["any_zero"]
-        and trajectories[c]["all_equal_when_active"]
-    ]
-    # 2) Joined mid: first == 0, becomes nonzero exactly once
-    joined_mid = []
-    for c in customers:
-        ms = trajectories[c]["values"]
-        if ms[0] == 0:
-            # find first nonzero
-            for k, x in enumerate(ms):
-                if x > 0:
-                    # Flat thereafter?
-                    rest = ms[k:]
-                    if all(abs(r - rest[0]) < 0.005 for r in rest):
-                        joined_mid.append(c)
-                    break
-    # 3) Churned: nonzero then zero, stays zero
-    churned = []
-    for c in customers:
-        ms = trajectories[c]["values"]
-        if ms[0] > 0 and ms[-1] == 0:
-            # find first zero after nonzero start
-            saw_nonzero = False
-            ok = True
-            for x in ms:
-                if x > 0 and not saw_nonzero:
-                    saw_nonzero = True
-                elif saw_nonzero and x == 0:
-                    pass  # remains zero
-                elif saw_nonzero and x > 0:
-                    # resurrection -> not the clean churn pattern
-                    ok = False
-                    break
-            if ok:
-                churned.append(c)
-    # 4) Upsell: any month classified as upsell
-    upsold = sorted({c for (c, _m), (b, _a) in bucket_index.items() if b == "upsell"})
-    # 5) Largest customer: by total spend
-    totals = [(c, sum(v(c, m) for m in months)) for c in customers]
-    totals.sort(key=lambda x: x[1], reverse=True)
-    largest = [totals[0][0]] if totals else []
-
-    picks: list[tuple[str, str]] = []  # (label, customer_id)
-    if never_changed:
-        picks.append(("never_changed", never_changed[0]))
-    if joined_mid:
-        picks.append(("joined_mid", joined_mid[0]))
-    if churned:
-        picks.append(("churned", churned[0]))
-    if upsold:
-        picks.append(("upsold", upsold[0]))
-    if largest:
-        picks.append(("largest", largest[0]))
-
-    for label, c in picks:
-        # Walk through and verify classification matches rule
-        per_month = []
-        ok = True
-        for i in range(1, len(months)):
-            m_prev = months[i - 1]
-            m_curr = months[i]
-            prior = v(c, m_prev)
-            current = v(c, m_curr)
-            expected_bucket, expected_amt = classify(prior, current)
-            actual_bucket, actual_amt = bucket_index[(c, m_curr)]
-            match = expected_bucket == actual_bucket and abs(expected_amt - actual_amt) < 0.01
-            if not match:
-                ok = False
-            per_month.append(
-                {
-                    "month": m_curr,
-                    "prior": _round2(prior),
-                    "current": _round2(current),
-                    "expected": expected_bucket,
-                    "actual": actual_bucket,
-                    "match": match,
-                }
-            )
-        samples.append({"label": label, "customer_id": c, "ok": ok, "trace": per_month})
-        if not ok:
-            layer4_pass = False
-
-    # Sample richness: prefer to have at least 3 distinct labels
-    if len(picks) < 3:
-        layer4_pass = False
-
-    layer4 = {"pass": layer4_pass, "samples": samples}
-
-    # ---- Layer 5: edge cases ---------------------------------------------
+    # ---- Layer 4: edge cases ---------------------------------------------
     resurrections = []
     for c in customers:
-        ms = trajectories[c]["values"]
+        ms = trajectories[c]
         # Pattern: nonzero ... zero ... nonzero
         saw_nonzero = False
         saw_zero_after = False
@@ -618,13 +545,13 @@ def run_verification(
                 resurrections.append(c)
                 break
 
-    layer5 = {
+    layer4 = {
         "resurrections": resurrections,
         "duplicates": duplicates,
         "negatives": negatives,
     }
 
-    # ---- Layer 6: reasonableness / benchmark sniff -----------------------
+    # ---- Layer 5: reasonableness / benchmark sniff -----------------------
     gross_le_net = True
     nrr_under_140 = True
     for r in metrics_monthly:
@@ -645,14 +572,14 @@ def run_verification(
         if r["logo"] is not None and r["net"] is not None:
             logo_vs_dollar.append({"month": r["month"], "logo": r["logo"], "dollar_net": r["net"]})
 
-    layer6 = {
+    layer5 = {
         "pass": gross_le_net and nrr_under_140,
         "gross_le_net": gross_le_net,
         "nrr_under_140": nrr_under_140,
         "logo_vs_dollar": logo_vs_dollar[:6],  # truncate
     }
 
-    # ---- Layer 7: cross-check vs company-stated --------------------------
+    # ---- Layer 6: cross-check vs company-stated --------------------------
     if stated_retention:
         # stated_retention is a dict like {"net_ltm": 1.10, "month": "2026-03"}
         diffs = []
@@ -676,19 +603,19 @@ def run_verification(
                         "ok": abs(actual - expected) < 0.005,
                     }
                 )
-        layer7 = {
+        layer6 = {
             "applicable": True,
             "pass": all(d["ok"] for d in diffs),
             "diffs": diffs,
         }
     else:
-        layer7 = {
+        layer6 = {
             "applicable": False,
             "pass": True,  # not applicable counts as pass
             "note": "no stated retention figure provided",
         }
 
-    # ---- Layer 8: compute it two ways ------------------------------------
+    # ---- Layer 7: compute it two ways ------------------------------------
     # Build-up method: monthly's net retention via aggregates (already in metrics_monthly)
     # Direct cohort method (for monthly): cohort = customers active at m_prev,
     # sum their revenue at m and at m_prev, NRR = (sum_now + 0_for_new)/sum_prev.
@@ -708,7 +635,7 @@ def run_verification(
             disagreement = abs(nrr_direct - nrr_buildup)
             if disagreement > max_disagreement:
                 max_disagreement = disagreement
-    layer8 = {
+    layer7 = {
         "pass": max_disagreement < 1e-4,
         "max_disagreement_pct": round(max_disagreement, 8),
     }
@@ -717,11 +644,10 @@ def run_verification(
         "layer_1_identity": layer1,
         "layer_2_stitching": layer2,
         "layer_3_exclusivity": layer3,
-        "layer_4_sample_trace": layer4,
-        "layer_5_edge_cases": layer5,
-        "layer_6_benchmark_sniff": layer6,
-        "layer_7_company_stated": layer7,
-        "layer_8_two_methods": layer8,
+        "layer_4_edge_cases": layer4,
+        "layer_5_benchmark_sniff": layer5,
+        "layer_6_company_stated": layer6,
+        "layer_7_two_methods": layer7,
     }
 
 
@@ -734,11 +660,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Retention compute (Phases 5-7).")
     parser.add_argument("csv_path", help="Path to long-format CSV (customer_id, month, mrr)")
     parser.add_argument("--arr-factor", type=float, default=1.0, help="Multiply MRR by this to get ARR (use 12 for MRR input)")
+    parser.add_argument("--lookback", type=int, default=12,
+                        help="Comparison lookback in months for the rollforward/retention that matches "
+                             "the deliverable corkscrew: 12 = year-over-year (default), 1 = month-over-month. "
+                             "Set this to the SAME value passed to deliver.py --lookback.")
     parser.add_argument("--output", default=None, help="Write JSON to this file (default: stdout)")
     args = parser.parse_args(argv)
 
+    import time
+    _t0 = time.perf_counter()
     rows = load_long_csv(args.csv_path)
-    result = compute(rows, arr_factor=args.arr_factor)
+    result = compute(rows, arr_factor=args.arr_factor, lookback=args.lookback)
 
     text = json.dumps(result, indent=2, default=str)
     if args.output:
@@ -746,6 +678,7 @@ def main(argv: list[str] | None = None) -> int:
             fh.write(text)
     else:
         print(text)
+    print(f"[compute.py] computed + verified in {time.perf_counter() - _t0:.2f}s", file=sys.stderr)
     return 0
 
 
@@ -762,16 +695,6 @@ def _self_test(xlsx_path: str | None = None) -> int:
     skill).
     """
     import tempfile
-
-    # Defensive sys.path hygiene: strip the script's directory before importing
-    # openpyxl, in case any future sibling file shadows a stdlib module openpyxl
-    # imports transitively. Cheap insurance.
-    here = os.path.dirname(os.path.abspath(__file__))
-    sys.path[:] = [p for p in sys.path if os.path.abspath(p) != here]
-    # Pop any partially-imported local `inspect` so openpyxl reimports stdlib
-    if "inspect" in sys.modules and getattr(sys.modules["inspect"], "__file__", "") and \
-            os.path.abspath(sys.modules["inspect"].__file__).startswith(here):
-        del sys.modules["inspect"]
 
     try:
         import openpyxl  # type: ignore
@@ -862,23 +785,20 @@ def _self_test(xlsx_path: str | None = None) -> int:
                           f"failures = {len(layers['layer_2_stitching'].get('failures', []))}"))
     layer_results.append(("Layer 3 — Bucket exclusivity", get_pass(layers["layer_3_exclusivity"]),
                           f"failures = {len(layers['layer_3_exclusivity'].get('failures', []))}"))
-    l4 = layers["layer_4_sample_trace"]
-    layer_results.append(("Layer 4 — Sample-trace by hand", get_pass(l4),
-                          f"samples = {len(l4['samples'])}, all ok = {all(s['ok'] for s in l4['samples'])}"))
-    l5 = layers["layer_5_edge_cases"]
-    # Layer 5 has no pass/fail; it's a flag report. Pass if it produced lists.
-    l5_pass = isinstance(l5.get("resurrections"), list)
-    layer_results.append(("Layer 5 — Edge-case scan", l5_pass,
-                          f"resurrections={len(l5['resurrections'])}, duplicates={len(l5['duplicates'])}, negatives={len(l5['negatives'])}"))
-    l6 = layers["layer_6_benchmark_sniff"]
-    layer_results.append(("Layer 6 — Reasonableness sniff", get_pass(l6),
-                          f"gross_le_net={l6['gross_le_net']}, nrr_under_140={l6['nrr_under_140']}"))
-    l7 = layers["layer_7_company_stated"]
-    layer_results.append(("Layer 7 — Company-stated cross-check", get_pass(l7),
-                          l7.get("note", "applicable")))
-    l8 = layers["layer_8_two_methods"]
-    layer_results.append(("Layer 8 — Compute two ways", get_pass(l8),
-                          f"max_disagreement_pct = {l8['max_disagreement_pct']}"))
+    l4 = layers["layer_4_edge_cases"]
+    # Layer 4 has no pass/fail; it's a flag report. Pass if it produced lists.
+    l4_pass = isinstance(l4.get("resurrections"), list)
+    layer_results.append(("Layer 4 — Edge-case scan", l4_pass,
+                          f"resurrections={len(l4['resurrections'])}, duplicates={len(l4['duplicates'])}, negatives={len(l4['negatives'])}"))
+    l5 = layers["layer_5_benchmark_sniff"]
+    layer_results.append(("Layer 5 — Reasonableness sniff", get_pass(l5),
+                          f"gross_le_net={l5['gross_le_net']}, nrr_under_140={l5['nrr_under_140']}"))
+    l6 = layers["layer_6_company_stated"]
+    layer_results.append(("Layer 6 — Company-stated cross-check", get_pass(l6),
+                          l6.get("note", "applicable")))
+    l7 = layers["layer_7_two_methods"]
+    layer_results.append(("Layer 7 — Compute two ways", get_pass(l7),
+                          f"max_disagreement_pct = {l7['max_disagreement_pct']}"))
 
     print("\nVERIFICATION LAYERS")
     print("-" * 72)
@@ -954,6 +874,58 @@ def _self_test(xlsx_path: str | None = None) -> int:
          bool(ltm) and len(ltm) == 6, f"len = {len(ltm) if ltm else 0}")
     )
 
+    # --- Lookback rollforward (YoY, lookback=12) — matches the deliver.py corkscrew ---
+    cfg2 = result["config"]
+    asserts.append(("config.lookback == 12", cfg2.get("lookback") == 12, f"got {cfg2.get('lookback')}"))
+    rf = result["rollforward"]
+    asserts.append(
+        ("config.n_periods == 6 and len(rollforward) == 6 (18 months − 12 lookback)",
+         cfg2.get("n_periods") == 6 and len(rf) == 6, f"n_periods={cfg2.get('n_periods')}, len={len(rf)}")
+    )
+    asserts.append(("len(metrics) == 6 (YoY retention periods)", len(result["metrics"]) == 6,
+                    f"got {len(result['metrics'])}"))
+    # Each period's rollforward identity must hold exactly.
+    id_ok = all(
+        abs(p["beginning"] + p["new"] + p["upsell"] + p["downsell"] + p["churn"] - p["ending"]) < 0.01
+        for p in rf
+    )
+    asserts.append(("YoY identity Beg+New+Up+Down+Churn == Ending for every period", id_ok, "checked all 6"))
+    # Cross-path check: the YoY period ending is the total at month i, and its
+    # beginning is the total at month i−12. Both also equal the MoM rollforward's
+    # ending at those months — computed via a DIFFERENT path — so equality is a
+    # real validation, not a tautology.
+    monthly = result["monthly"]
+    cross_ok = True
+    cross_detail = "all match"
+    for k, p in enumerate(rf):
+        i = 12 + k
+        if abs(p["ending"] - monthly[i]["ending"]) > 0.01:
+            cross_ok = False
+            cross_detail = f"period {p['month']} ending {p['ending']} != monthly {monthly[i]['ending']}"
+            break
+        if abs(p["beginning"] - monthly[i - 12]["ending"]) > 0.01:
+            cross_ok = False
+            cross_detail = f"period {p['month']} beginning {p['beginning']} != monthly[{i-12}] {monthly[i-12]['ending']}"
+            break
+    asserts.append(("YoY ending/beginning tie to the independent MoM totals", cross_ok, cross_detail))
+    # MoM equivalence: with lookback=1 the generalised rollforward must reproduce
+    # the existing MoM buckets — proof the generalisation degrades correctly.
+    result_mom = compute(rows, arr_factor=12.0, lookback=1)
+    rf1 = result_mom["rollforward"]
+    mom_ok = len(rf1) == 17
+    mom_detail = f"len={len(rf1)}"
+    if mom_ok:
+        for k, p in enumerate(rf1):
+            mm = monthly[k + 1]  # monthly[0] is the opening row
+            for key in ("new", "upsell", "downsell", "churn", "ending"):
+                if abs(p[key] - mm[key]) > 0.01:
+                    mom_ok = False
+                    mom_detail = f"{p['month']}.{key}: {p[key]} != monthly {mm[key]}"
+                    break
+            if not mom_ok:
+                break
+    asserts.append(("lookback=1 reproduces the MoM rollforward buckets exactly", mom_ok, mom_detail))
+
     for name, ok, detail in asserts:
         marker = "PASS" if ok else "FAIL"
         print(f"  [{marker}] {name}  ({detail})")
@@ -982,7 +954,7 @@ def _self_test(xlsx_path: str | None = None) -> int:
 
     print("\n" + "=" * 72)
     if all_layers_pass and all_asserts_pass:
-        print("OVERALL: PASS — all 8 verification layers + all asserts passed.")
+        print("OVERALL: PASS — all 7 verification layers + all asserts passed.")
     else:
         print(
             f"OVERALL: FAIL — layers_ok={all_layers_pass}, asserts_ok={all_asserts_pass}"

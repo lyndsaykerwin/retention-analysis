@@ -1,6 +1,13 @@
 # retention-analysis
 
-A Claude Code skill that turns a customer-by-month revenue workbook into a finished SaaS retention analysis. Drop in an Excel file where rows are customers and columns are months of MRR (monthly recurring revenue — what each customer pays per month) or ARR (annual recurring revenue — the same thing annualized), and the skill returns a three-tab Excel deliverable: a retention rollforward (a month-by-month walk from starting revenue to ending revenue, showing what came in, what churned, and what expanded), plus monthly and LTM (last-twelve-month) Gross, Net, and Logo retention rates. Every number is a live formula traceable back to the source data — no hardcoded values, full audit trail.
+An agent skill that turns customer-level revenue into an **investor-grade SaaS retention analysis**. Works in any agent harness that can run a skill.
+
+Give it customer-level recurring revenue in whatever shape you have it:
+
+- **Wide** — one row per customer, one column per month (the typical exported spreadsheet), or
+- **Long / "tidy"** — one row per customer per month (columns like `customer_id, month, mrr`),
+
+as an **Excel file or a CSV**, holding either MRR (monthly recurring revenue — what each customer pays per month) or ARR (annual recurring revenue — the same thing annualized). The skill returns an Excel deliverable: a retention rollforward (a period-by-period walk from starting revenue to ending revenue, showing what came in, what churned, and what expanded), plus Gross, Net, and Logo retention rates, with LTM (last-twelve-month) views where the data supports them. Every number is a live formula traceable back to the source data — no hardcoded values, full audit trail.
 
 ## What it's for / what it's NOT for
 
@@ -15,17 +22,17 @@ A Claude Code skill that turns a customer-by-month revenue workbook into a finis
 
 ## Install
 
-**As a Claude Code skill** — clone directly into the skills folder so Claude can find it:
+**As an agent skill** — clone it into your agent's skills folder so the agent can discover it. For example:
 
 ```
-git clone https://github.com/lyndsaykerwin/retention-analysis-skill.git ~/.claude/skills/retention-analysis
+git clone https://github.com/lyndsaykerwin/retention-analysis.git <your-agent-skills-folder>/retention-analysis
 ```
 
 **As a standalone Python tool** — clone anywhere and run the scripts directly:
 
 ```
-git clone https://github.com/lyndsaykerwin/retention-analysis-skill.git
-cd retention-analysis-skill
+git clone https://github.com/lyndsaykerwin/retention-analysis.git
+cd retention-analysis
 ```
 
 ## Dependencies
@@ -45,30 +52,32 @@ Why LibreOffice: after the skill writes all the Excel formulas, it runs `soffice
 ## Quickstart — run the self-tests
 
 ```
-cd ~/.claude/skills/retention-analysis   # or wherever you cloned it
+cd retention-analysis   # or wherever you cloned it
 python3 scripts/survey.py --self-test
 python3 scripts/compute.py --self-test
 ```
 
 Both should print `PASS` and exit 0. They run against the bundled fixture at `scripts/fixtures/sample_retention_data.xlsx` — 10 synthetic SaaS customers across 18 months of revenue, covering every retention bucket (new, churned, expanded, contracted, resurrected).
 
-## Using it inside Claude Code
+## Using it inside an agent
 
-Once installed in `~/.claude/skills/`, open Claude Code in a folder containing a real retention workbook and ask something like:
+Once the skill is installed in your agent's skills folder, point the agent at a folder containing a real retention workbook and ask something like:
 
 > "Analyze the customer retention in this workbook"
 
-Claude will trigger the skill, run the survey step, ask you ONE upfront question to confirm schema and methodology, then build the deliverable end-to-end. The skill explicitly tells Claude not to drip-feed checkpoints — one confirmation up front, then it runs.
+The agent triggers the skill, runs the survey step, asks you one upfront question to confirm schema and methodology, then builds the deliverable end-to-end.
 
 ## What's in the repo
 
 ```
-SKILL.md                              # the spec Claude follows
+SKILL.md                              # the spec the agent follows (decisions + workflow)
+reference/
+  formulas-and-layout.md              # exact formulas/layout/formatting (only for hand-building)
 scripts/
-  survey.py                           # phase 1: inspect the workbook, hypothesize structure
-  compute.py                          # phase 2: compute metrics from long-format CSV
-                                      #          (one row per customer-month, the tidy shape)
-  deliver.py                          # phase 3: write the three-tab Excel deliverable
+  survey.py                           # inspect the workbook, hypothesize its structure
+  compute.py                          # OPTIONAL independent cross-check of the metrics
+                                      #          (the deliverable does NOT depend on it)
+  deliver.py                          # write the Excel deliverable (builds from the CSV)
   fixtures/
     sample_retention_data.xlsx        # synthetic test data
     EXPECTED_VALUES.md                # hand-computed values the self-tests check against
@@ -78,6 +87,8 @@ README.md
 
 ## Methodology (brief)
 
+**Comparison period.** By default the analysis compares **equivalent periods one year apart** (year-over-year) — this period versus the same period twelve months earlier. That's the right lens for businesses on **annual contracts**, where the renewal decision happens once a year. For businesses on **monthly contracts**, ask for **month-over-month** comparisons (this period versus the immediately prior one) instead.
+
 Retention metrics follow the SaaS Metrics Standards Board definitions for Gross retention (revenue kept, capped at 100%), Net retention (revenue kept plus expansion from existing customers, can exceed 100%), and Logo retention (count of customers kept, regardless of dollars). LTM retention uses the direct-cohort point-in-time method — take the set of customers active 12 months ago, sum their revenue today, divide by their revenue then.
 
-Full methodology, formula patterns, edge-case handling, and visual conventions are in `SKILL.md`.
+Full methodology and edge-case handling are in `SKILL.md`; exact formula patterns and visual conventions are in `reference/formulas-and-layout.md`.

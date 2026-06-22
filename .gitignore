@@ -26,5 +26,8 @@ out/
 output/
 scratch/
 
-# Per-user Claude Code state if someone clones into ~/.claude/skills/
+# Per-user agent state if someone clones into a skills folder
 .claude/
+
+# Per-user agent / MCP harness config — not part of the skill, keep it private
+.mcp.json
